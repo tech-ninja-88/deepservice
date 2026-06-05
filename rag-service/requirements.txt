@@ -1,0 +1,40 @@
+# ============================================================
+# DeepService RAG Service — 核心依赖
+# 企业级检索增强生成模块
+# ============================================================
+
+# --- LLM & Embedding ---
+openai>=1.30.0              # DeepSeek API 兼容 OpenAI SDK
+tiktoken>=0.7.0             # Token 计数
+
+# --- 向量数据库 ---
+chromadb>=0.5.0             # 向量存储与检索（内置 SQLite 后端）
+
+# --- 文档解析 ---
+langchain>=0.3.0            # 文档加载器 & 文本分割器
+langchain-text-splitters>=0.3.0
+langchain-community>=0.3.0
+pypdf>=4.0.0                # PDF 解析
+python-docx>=1.1.0          # Word 文档解析
+markdown>=3.6               # Markdown 解析
+beautifulsoup4>=4.12        # HTML 清洗
+unstructured>=0.14.0        # 通用文档解析（备选）
+
+# --- 关键词检索 ---
+rank-bm25>=0.2.2            # BM25 算法
+
+# --- 重排序 ---
+sentence-transformers>=3.0  # Cross-Encoder 重排序（备选）
+
+# --- 工具库 ---
+numpy>=1.26                 # 向量运算
+scikit-learn>=1.5           # 余弦相似度等
+python-dotenv>=1.0          # 环境变量管理
+tenacity>=8.4               # 重试机制
+pydantic>=2.8               # 数据模型验证
+loguru>=0.7                 # 结构化日志
+
+# --- API 服务(可选) ---
+fastapi>=0.112              # REST API
+uvicorn>=0.30               # ASGI 服务器
+sse-starlette>=2.0          # SSE 流式支持
