@@ -664,8 +664,12 @@ class DialogueOrchestrator:
         """直接 LLM 对话（不经过 RAG）"""
         try:
             from openai import OpenAI
+            from config import get_api_key
+            api_key = get_api_key()
+            if not api_key:
+                raise ValueError("DEEPSEEK_API_KEY 未设置")
             client = OpenAI(
-                api_key=self.config.llm.api_key,
+                api_key=api_key,
                 base_url=self.config.llm.base_url,
             )
             memory_context = memory.to_prompt_context()

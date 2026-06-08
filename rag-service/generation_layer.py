@@ -286,9 +286,16 @@ class DeepSeekClient:
     """
 
     def __init__(self):
+        from config import get_api_key
         config = get_config().llm
+        api_key = get_api_key()
+        if not api_key:
+            raise ValueError(
+                "DEEPSEEK_API_KEY 未设置。请在 .env 文件或环境变量中配置。\n"
+                "获取方式: https://platform.deepseek.com/api_keys"
+            )
         self.client = OpenAI(
-            api_key=config.api_key,
+            api_key=api_key,
             base_url=config.base_url,
         )
         self.chat_model = config.chat_model

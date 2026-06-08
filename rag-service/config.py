@@ -26,22 +26,35 @@ load_dotenv(Path(__file__).parent.parent / ".env.local", override=False)
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
 # Railway 变量有时传不进来，兜底方案：从文件读取
-def _get_api_key() -> str:
-    """多渠道获取 API Key：环境变量 → .env 文件 → /app/api_key.txt"""
+def get_api_key() -> str:
+    """多渠道获取 API Key：环境变量 → .env 文件 → /app/api_key.txt
+
+    注意：此函数每次调用都重新检查所有来源，不缓存结果。
+    这样在 Railway Console 中手动创建 /app/api_key.txt 后，
+    下一次 API 请求就能自动读取，无需重启进程。
+    """
+    # 1. 优先环境变量
     key = os.getenv("DEEPSEEK_API_KEY", "")
     if key and key != "sk-your-api-key-here":
         return key
-    # 尝试从文件读取（Railway Console 手动创建）
+
+    # 2. 尝试从文件读取（Railway Console 手动创建兜底）
     for key_file in ["/app/api_key.txt", "api_key.txt"]:
         try:
             with open(key_file, "r") as f:
                 key = f.read().strip()
                 if key and key.startswith("sk-"):
+                    # 读取成功后同步到环境变量，后续调用直接命中第1步
                     os.environ["DEEPSEEK_API_KEY"] = key
                     return key
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError, IOError):
             pass
-    return key
+
+    # 3. 返回空字符串（调用方负责检查并给出友好错误）
+    return ""
+
+# 向后兼容别名
+_get_api_key = get_api_key
 
 
 # ============================================================================
@@ -69,9 +82,16 @@ class LLMConfig:
     intent_temperature: float = 0.1             # 意图分类用低温度
 
     def __post_init__(self):
+        # 不在初始化时强制验证 API Key —— 允许服务先启动，
+        # 后续通过环境变量或 /app/api_key.txt 文件动态注入密钥。
+        # 实际调用 DeepSeek API 时（通过 get_api_key() 获取）会再次检查。
         if not self.api_key:
-            raise ValueError(
-                "DEEPSEEK_API_KEY 未设置。请在 .env 文件或环境变量中配置。\n"
+            import warnings
+            warnings.warn(
+                "⚠️ DEEPSEEK_API_KEY 未设置。服务可启动但无法调用 LLM。\n"
+                "请通过以下方式之一配置：\n"
+                "  1. Railway → Service Variables → DEEPSEEK_API_KEY\n"
+                "  2. Railway Console: echo 'sk-xxx' > /app/api_key.txt\n"
                 "获取方式: https://platform.deepseek.com/api_keys"
             )
 

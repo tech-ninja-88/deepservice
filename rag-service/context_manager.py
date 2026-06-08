@@ -373,8 +373,12 @@ class ContextManager:
         # 调用 DeepSeek 生成摘要
         try:
             from openai import OpenAI
+            from config import get_api_key
+            api_key = get_api_key()
+            if not api_key:
+                raise ValueError("DEEPSEEK_API_KEY 未设置")
             client = OpenAI(
-                api_key=self.config.llm.api_key,
+                api_key=api_key,
                 base_url=self.config.llm.base_url,
             )
 
