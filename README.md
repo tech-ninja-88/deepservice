@@ -1,7 +1,7 @@
 # 🤖 DeepService — 企业级智能客服中台
 
 > 基于 **DeepSeek 大模型 + RAG** 的企业级智能客服系统  
-> 🎯 **从根上解决 AI 幻觉** —— 四层防御体系 + 混合检索 + 知识边界控制
+> 🎯 **从根本上解决 AI 幻觉** —— 四层防御体系 + 混合检索 + 知识边界控制
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python" alt="Python">
@@ -18,7 +18,7 @@
 
 DeepService 是一款面向中小企业的 **AI 智能客服中台**，基于 DeepSeek 大语言模型和 RAG（检索增强生成）技术构建。核心差异化在于自主研发的 **四层 AI 幻觉防御体系**——从根本上解决大模型"胡说八道"的问题，让 AI 客服做到"不知道就说不知道"。
 
-### 🎯 面试定位
+### 🎯 定位
 
 本项目针对 **AI 应用开发工程师 / 智能客服系统开发工程师 / 全栈 AI 工程师** 岗位设计，展示了：
 
@@ -36,7 +36,7 @@ DeepService 是一款面向中小企业的 **AI 智能客服中台**，基于 De
 
 | 环境 | 地址 | 说明 |
 |------|------|------|
-| **🟢 前端** | [https://deepservice.vercel.app](https://deepservice.vercel.app) | 聊天界面（面试官打开此链接） |
+| **🟢 前端** | [https://deepservice.vercel.app](https://deepservice.vercel.app) | 聊天界面 |
 | **🔵 API 文档** | [https://deepservice-api.onrender.com/docs](https://deepservice-api.onrender.com/docs) | Swagger 自动生成的 API 文档 |
 | **🟣 管理后台** | [https://deepservice.vercel.app/admin](https://deepservice.vercel.app/admin) | 对话日志 / 知识库管理 |
 
@@ -191,7 +191,7 @@ deepservice/
 
 ---
 
-## 🎤 面试演示脚本
+## 🎤 演示脚本
 
 ### 30 秒开场
 > "这是我独立设计开发的企业级智能客服系统 DeepService。它基于 DeepSeek 大模型，核心亮点是四层幻觉防护体系——让 AI 客服'不知道就说不知道'，从根本上解决大模型胡说八道的问题。"
@@ -238,11 +238,10 @@ deepservice/
 
 ## 📝 License
 
-MIT License — 可用于个人学习、面试展示和商业用途。
+MIT License — 仅用于个人学习、面试展示。
 
 ---
 
 <p align="center">
   <b>DeepService</b> — 让 AI 客服有边界、有依据、可信赖<br>
-  Built with ❤️ by AI Full-Stack Engineer
 </p>
