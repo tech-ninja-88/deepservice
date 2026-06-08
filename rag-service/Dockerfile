@@ -5,10 +5,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# 从仓库根目录构建，所以路径要加 rag-service/ 前缀
+COPY rag-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY rag-service/ .
 
 RUN mkdir -p /app/data /app/logs /app/chroma_db
 
