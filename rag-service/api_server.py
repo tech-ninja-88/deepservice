@@ -464,10 +464,11 @@ if __name__ == "__main__":
     logger.info(f"DeepService API 启动: http://0.0.0.0:{port}")
     logger.info(f"API 文档: http://0.0.0.0:{port}/docs")
 
+    is_dev = os.getenv("RAILWAY_ENVIRONMENT") is None
     uvicorn.run(
         "api_server:app",
         host="0.0.0.0",
         port=port,
-        reload=True,
+        reload=is_dev,              # 本地开发可热重载，Railway 上关闭
         log_level="info",
     )

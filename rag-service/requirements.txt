@@ -18,13 +18,13 @@ pypdf>=4.0.0                # PDF 解析
 python-docx>=1.1.0          # Word 文档解析
 markdown>=3.6               # Markdown 解析
 beautifulsoup4>=4.12        # HTML 清洗
-unstructured>=0.14.0        # 通用文档解析（备选）
+# unstructured>=0.14.0        # 通用文档解析（备选，部署时禁用）
 
 # --- 关键词检索 ---
 rank-bm25>=0.2.2            # BM25 算法
 
 # --- 重排序 ---
-sentence-transformers>=3.0  # Cross-Encoder 重排序（备选）
+# sentence-transformers>=3.0  # Cross-Encoder 重排序（本地部署时启用）
 
 # --- 工具库 ---
 numpy>=1.26                 # 向量运算
