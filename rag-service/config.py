@@ -25,6 +25,24 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env.local", override=False)
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
+# Railway 变量有时传不进来，兜底方案：从文件读取
+def _get_api_key() -> str:
+    """多渠道获取 API Key：环境变量 → .env 文件 → /app/api_key.txt"""
+    key = os.getenv("DEEPSEEK_API_KEY", "")
+    if key and key != "sk-your-api-key-here":
+        return key
+    # 尝试从文件读取（Railway Console 手动创建）
+    for key_file in ["/app/api_key.txt", "api_key.txt"]:
+        try:
+            with open(key_file, "r") as f:
+                key = f.read().strip()
+                if key and key.startswith("sk-"):
+                    os.environ["DEEPSEEK_API_KEY"] = key
+                    return key
+        except FileNotFoundError:
+            pass
+    return key
+
 
 # ============================================================================
 # 数据模型验证
@@ -32,7 +50,7 @@ load_dotenv(Path(__file__).parent / ".env", override=False)
 @dataclass
 class LLMConfig:
     """DeepSeek API 配置"""
-    api_key: str = field(default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", ""))
+    api_key: str = field(default_factory=_get_api_key)
     base_url: str = field(default_factory=lambda: os.getenv(
         "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
     ))
