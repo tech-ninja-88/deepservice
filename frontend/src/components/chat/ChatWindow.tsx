@@ -27,7 +27,6 @@ export function ChatWindow({ messages, isStreaming, onRate, onRegenerate, classN
         {messages.length === 0 ? (
           /* Welcome Screen */
           <div className="flex flex-col items-center justify-center min-h-[60vh] text-center">
-            <div className="text-6xl mb-6">🤖</div>
             <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">
               DeepService 企业智能客服
             </h2>
