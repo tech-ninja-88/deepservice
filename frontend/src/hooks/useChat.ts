@@ -12,13 +12,16 @@ import type { Message, SSETokenEvent } from "@/types/chat";
 export function useChat() {
   const store = useChatStore();
   const abortRef = useRef<AbortController | null>(null);
+  const sendingRef = useRef(false);
   const [inputValue, setInputValue] = useState("");
 
   /** 发送消息（流式） */
   const sendMessage = useCallback(
     async (text?: string) => {
+      if (sendingRef.current) return;
       const content = text || inputValue.trim();
       if (!content || store.isStreaming) return;
+      sendingRef.current = true;
 
       setInputValue("");
 
@@ -80,6 +83,7 @@ export function useChat() {
           },
           // onDone
           () => {
+            sendingRef.current = false;
             store.setStreaming({ isStreaming: false, streamContent: "" });
             // 刷新会话列表
             if (store.currentId) {
@@ -90,6 +94,7 @@ export function useChat() {
 
         abortRef.current = abortRef.current; // keep ref for cancel
       } catch (err) {
+        sendingRef.current = false;
         store.setError(err instanceof Error ? err.message : "Unknown error");
         store.setStreaming({ isStreaming: false, streamContent: "" });
       }
@@ -100,6 +105,7 @@ export function useChat() {
   /** 取消当前生成 */
   const cancelGeneration = useCallback(() => {
     abortRef.current?.abort();
+    sendingRef.current = false;
     store.setStreaming({ isStreaming: false, streamContent: "" });
     abortRef.current = null;
   }, [store]);
