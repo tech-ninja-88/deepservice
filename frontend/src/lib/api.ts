@@ -30,7 +30,7 @@ class ApiClient {
     return res.json();
   }
 
-  /** 流式对话 — 返回 ReadableStream 用于 SSE */
+  /** 流式对话 */
   async chatStream(
     message: string,
     conversationId?: string,
@@ -104,13 +104,6 @@ class ApiClient {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let streamDone = false;
-
-    const fireDone = () => {
-      if (streamDone) return; // 防止重复调用
-      streamDone = true;
-      onDone();
-    };
 
     (async () => {
       try {
@@ -131,18 +124,18 @@ class ApiClient {
             if (line.startsWith("data: ")) {
               try {
                 const data = JSON.parse(line.slice(6));
-                // metadata — 先处理，避免 content 字段被误当 token
+                // metadata/done/error 事件和 token 互斥处理
                 if (currentEvent === "metadata") {
                   onEvent({ type: "metadata", data } as SSETokenEvent);
                 } else if (currentEvent === "done") {
-                  fireDone();
+                  onDone();
                   return;
                 } else if (currentEvent === "error") {
                   onError(new Error(data.error || "Stream error"));
-                  fireDone();
+                  onDone();
                   return;
                 } else if (data.content) {
-                  // token: backend sends {"content": "..."} without event prefix
+                  // 普通 token: {"content": "..."} 无事件前缀
                   onToken(data.content);
                 }
               } catch {
@@ -152,11 +145,11 @@ class ApiClient {
             }
           }
         }
-        fireDone();
+        onDone();
       } catch (err) {
         if (!controller.signal.aborted) {
           onError(err instanceof Error ? err : new Error(String(err)));
-          fireDone();
+          onDone();
         }
       }
     })();

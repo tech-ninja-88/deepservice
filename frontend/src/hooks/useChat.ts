@@ -6,22 +6,19 @@
 
 import { useCallback, useRef, useState } from "react";
 import { useChatStore } from "@/stores/chat-store";
-import apiClient from "@/lib/api";
-import type { Message } from "@/types/chat";
+import apiClient, { ApiClient } from "@/lib/api";
+import type { Message, SSETokenEvent } from "@/types/chat";
 
 export function useChat() {
   const store = useChatStore();
   const abortRef = useRef<AbortController | null>(null);
-  const sendingRef = useRef(false);
   const [inputValue, setInputValue] = useState("");
 
-  /** 发送消息（非流式，避免 SSE 解析问题） */
+  /** 发送消息（流式） */
   const sendMessage = useCallback(
     async (text?: string) => {
-      if (sendingRef.current) return;
       const content = text || inputValue.trim();
       if (!content || store.isStreaming) return;
-      sendingRef.current = true;
 
       setInputValue("");
 
@@ -45,25 +42,52 @@ export function useChat() {
       store.setStreaming({ isStreaming: true, streamContent: "" });
 
       try {
-        const response = await apiClient.chat(content, store.currentId || undefined);
+        const stream = await apiClient.chatStream(
+          content,
+          store.currentId || undefined,
+          abortRef.current?.signal
+        );
 
-        // 更新 conversation_id
-        if (response.conversation_id && !store.currentId) {
-          store.setCurrentId(response.conversation_id);
-        }
+        const fullResponse: { metadata: Record<string, unknown> | null } = {
+          metadata: null,
+        };
 
-        // 一次性替换 assistant 消息内容
-        store.updateLastAssistant(response.content);
+        ApiClient.parseSSEStream(
+          stream,
+          // onToken
+          (token) => {
+            store.updateLastAssistant(token);
+            store.setStreaming({
+              isStreaming: true,
+              streamContent: store.streamContent + token,
+            });
+          },
+          // onEvent
+          (event: SSETokenEvent) => {
+            if (event.type === "metadata" && event.data) {
+              fullResponse.metadata = event.data as Record<string, unknown>;
+              const convId = (event.data as Record<string, unknown>).conversation_id as string;
+              if (convId && !store.currentId) {
+                store.setCurrentId(convId);
+              }
+            }
+          },
+          // onError
+          (err) => {
+            store.setError(err.message);
+            store.updateLastAssistant(`\n\n⚠️ 抱歉，回复生成失败：${err.message}`);
+          },
+          // onDone
+          () => {
+            store.setStreaming({ isStreaming: false, streamContent: "" });
+            if (store.currentId) {
+              apiClient.getConversations().then(store.setConversations).catch(() => {});
+            }
+          }
+        );
 
-        sendingRef.current = false;
-        store.setStreaming({ isStreaming: false, streamContent: "" });
-
-        // 刷新会话列表
-        if (store.currentId) {
-          apiClient.getConversations().then(store.setConversations).catch(() => {});
-        }
+        abortRef.current = abortRef.current;
       } catch (err) {
-        sendingRef.current = false;
         store.setError(err instanceof Error ? err.message : "Unknown error");
         store.setStreaming({ isStreaming: false, streamContent: "" });
       }
@@ -74,7 +98,6 @@ export function useChat() {
   /** 取消当前生成 */
   const cancelGeneration = useCallback(() => {
     abortRef.current?.abort();
-    sendingRef.current = false;
     store.setStreaming({ isStreaming: false, streamContent: "" });
     abortRef.current = null;
   }, [store]);
@@ -82,12 +105,10 @@ export function useChat() {
   /** 重新生成 */
   const regenerate = useCallback(() => {
     const msgs = store.messages;
-    // 移除最后一条 assistant 消息
     if (msgs.length > 0 && msgs[msgs.length - 1].role === "assistant") {
       const newMsgs = msgs.slice(0, -1);
       store.setMessages(newMsgs);
     }
-    // 重新发送上一条用户消息
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === "user") {
         sendMessage(msgs[i].content);
