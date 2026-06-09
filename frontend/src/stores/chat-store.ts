@@ -43,14 +43,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setCurrentId: (id) => set({ currentId: id }),
   setMessages: (msgs) => set({ messages: msgs }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
-  updateLastAssistant: (token) =>
+  updateLastAssistant: (content) =>
     set((s) => {
       const msgs = [...s.messages];
       for (let i = msgs.length - 1; i >= 0; i--) {
         if (msgs[i].role === "assistant") {
-          // 防止相同 token 被重复追加
-          if (msgs[i].content.endsWith(token)) continue;
-          msgs[i] = { ...msgs[i], content: msgs[i].content + token };
+          msgs[i] = { ...msgs[i], content: msgs[i].content + content };
           break;
         }
       }

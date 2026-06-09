@@ -131,24 +131,19 @@ class ApiClient {
             if (line.startsWith("data: ")) {
               try {
                 const data = JSON.parse(line.slice(6));
-                // token: backend sends {"content": "..."} without type field
-                if (data.content) {
-                  onToken(data.content);
-                }
-                // metadata
+                // metadata — 先处理，避免 content 字段被误当 token
                 if (currentEvent === "metadata") {
                   onEvent({ type: "metadata", data } as SSETokenEvent);
-                }
-                // error
-                if (currentEvent === "error") {
+                } else if (currentEvent === "done") {
+                  fireDone();
+                  return;
+                } else if (currentEvent === "error") {
                   onError(new Error(data.error || "Stream error"));
                   fireDone();
                   return;
-                }
-                // done
-                if (currentEvent === "done") {
-                  fireDone();
-                  return;
+                } else if (data.content) {
+                  // token: backend sends {"content": "..."} without event prefix
+                  onToken(data.content);
                 }
               } catch {
                 // skip non-JSON lines
