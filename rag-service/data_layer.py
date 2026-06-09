@@ -682,29 +682,17 @@ class EmbeddingGenerator:
 
     def _embed_local(self, text: str) -> List[float]:
         """
-        本地 BGE 模型 Embedding（离线场景）
-        需要安装: pip install sentence-transformers
+        本地 Embedding — 使用 ChromaDB 内置 ONNX 模型 (all-MiniLM-L6-v2)
+        无需 API Key，无需安装额外依赖，完全免费
         """
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            raise ImportError(
-                "本地 Embedding 需要 sentence-transformers。"
-                "安装: pip install sentence-transformers>=3.0"
-            )
+        # 懒加载 ChromaDB 默认 embedding 函数
+        if not hasattr(self, "_chromadb_ef"):
+            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+            logger.info("[EmbeddingGenerator] 加载 ChromaDB 内置 ONNX Embedding 模型...")
+            self._chromadb_ef = DefaultEmbeddingFunction()
 
-        # 懒加载模型（首次调用时加载）
-        if not hasattr(self, "_local_model"):
-            model_name = "BAAI/bge-large-zh-v1.5"
-            logger.info(f"[EmbeddingGenerator] 加载本地模型: {model_name}")
-            self._local_model = SentenceTransformer(model_name)
-
-        # BGE 模型需要在查询前加前缀
-        embedding = self._local_model.encode(
-            text,
-            normalize_embeddings=True,  # L2 归一化，用于余弦相似度
-        )
-        return embedding.tolist()
+        embedding = self._chromadb_ef([text])
+        return embedding[0]  # 返回第一个（也是唯一一个）embedding
 
 
 # ============================================================================

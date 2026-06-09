@@ -71,7 +71,7 @@ class LLMConfig:
     embedding_model: str = "deepseek-chat"      # DeepSeek 暂未提供专用 Embedding API
                                                 # 生产建议：text-embedding-3-small (OpenAI)
                                                 # 或 bge-large-zh-v1.5 (本地部署)
-    embedding_provider: Literal["deepseek", "openai", "local"] = "openai"
+    embedding_provider: Literal["deepseek", "openai", "local"] = "local"
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openai_embedding_model: str = "text-embedding-3-small"
 
