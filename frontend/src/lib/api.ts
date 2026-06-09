@@ -5,36 +5,17 @@
 
 import type { ChatResponse, Conversation, SSETokenEvent } from "@/types/chat";
 
-let _cachedBase: string | null = null;
-
-async function getApiBase(): Promise<string> {
-  if (_cachedBase) return _cachedBase;
-  // 运行时从 /api/config 读取后端地址（无需重新构建镜像）
-  try {
-    const res = await fetch("/api/config");
-    const cfg = await res.json();
-    if (cfg.apiUrl) {
-      _cachedBase = cfg.apiUrl;
-      return _cachedBase;
-    }
-  } catch { /* fallback */ }
-  _cachedBase = process.env.NEXT_PUBLIC_API_URL || "";
-  return _cachedBase;
-}
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 class ApiClient {
-  private baseUrl: string | null = null;
+  private baseUrl: string;
 
-  private async getBaseUrl(): Promise<string> {
-    if (!this.baseUrl) {
-      this.baseUrl = (await getApiBase()).replace(/\/$/, "");
-    }
-    return this.baseUrl;
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const base = await this.getBaseUrl();
-    const url = `${base}${path}`;
+    const url = `${this.baseUrl}${path}`;
     const res = await fetch(url, {
       ...options,
       headers: {
@@ -55,8 +36,7 @@ class ApiClient {
     conversationId?: string,
     signal?: AbortSignal
   ): Promise<ReadableStream<Uint8Array>> {
-    const base = await this.getBaseUrl();
-    const res = await fetch(`${base}/api/chat/stream`, {
+    const res = await fetch(`${this.baseUrl}/api/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, conversation_id: conversationId, stream: true }),

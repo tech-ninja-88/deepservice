@@ -46,4 +46,6 @@ jobs:
           context: frontend
           file: frontend/Dockerfile
           push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://ujkldxcxvupb.sealoshzh.site
           tags: ghcr.io/tech-ninja-88/deepservice-frontend:latest
