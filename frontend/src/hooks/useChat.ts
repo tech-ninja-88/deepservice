@@ -6,7 +6,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import { useChatStore } from "@/stores/chat-store";
-import apiClient from "@/lib/api";
+import apiClient, { ApiClient } from "@/lib/api";
 import type { Message, SSETokenEvent } from "@/types/chat";
 
 export function useChat() {
@@ -52,7 +52,7 @@ export function useChat() {
           metadata: null,
         };
 
-        apiClient.parseSSEStream(
+        ApiClient.parseSSEStream(
           stream,
           // onToken
           (token) => {
