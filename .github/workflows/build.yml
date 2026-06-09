@@ -25,7 +25,7 @@ jobs:
           context: .
           file: rag-service/Dockerfile
           push: true
-          tags: ghcr.io/tech-ninja-88/deepservice-api:latest
+          tags: ghcr.io/tech-ninja-88/deepservice:latest
 
   build-frontend:
     runs-on: ubuntu-latest
