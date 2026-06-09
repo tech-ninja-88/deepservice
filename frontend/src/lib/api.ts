@@ -116,22 +116,37 @@ class ApiClient {
           const lines = buffer.split("\n");
           buffer = lines.pop() || "";
 
+          let currentEvent = "";
           for (const line of lines) {
+            if (line.startsWith("event: ")) {
+              currentEvent = line.slice(7).trim();
+            }
             if (line.startsWith("data: ")) {
               try {
-                const data = JSON.parse(line.slice(6)) as SSETokenEvent;
-                if (data.type === "token" && data.content) {
+                const data = JSON.parse(line.slice(6));
+                // token: backend sends {"content": "..."} without type field
+                if (data.content) {
                   onToken(data.content);
                 }
-                onEvent(data);
-                if (data.type === "done" || data.type === "error") {
-                  if (data.type === "error") onError(new Error(data.error || "Stream error"));
+                // metadata
+                if (currentEvent === "metadata") {
+                  onEvent({ type: "metadata", data } as SSETokenEvent);
+                }
+                // error
+                if (currentEvent === "error") {
+                  onError(new Error(data.error || "Stream error"));
+                  onDone();
+                  return;
+                }
+                // done
+                if (currentEvent === "done") {
                   onDone();
                   return;
                 }
               } catch {
                 // skip non-JSON lines
               }
+              currentEvent = "";
             }
           }
         }
