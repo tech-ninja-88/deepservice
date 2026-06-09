@@ -104,6 +104,13 @@ class ApiClient {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let streamDone = false;
+
+    const fireDone = () => {
+      if (streamDone) return; // 防止重复调用
+      streamDone = true;
+      onDone();
+    };
 
     (async () => {
       try {
@@ -135,12 +142,12 @@ class ApiClient {
                 // error
                 if (currentEvent === "error") {
                   onError(new Error(data.error || "Stream error"));
-                  onDone();
+                  fireDone();
                   return;
                 }
                 // done
                 if (currentEvent === "done") {
-                  onDone();
+                  fireDone();
                   return;
                 }
               } catch {
@@ -150,11 +157,11 @@ class ApiClient {
             }
           }
         }
-        onDone();
+        fireDone();
       } catch (err) {
         if (!controller.signal.aborted) {
           onError(err instanceof Error ? err : new Error(String(err)));
-          onDone();
+          fireDone();
         }
       }
     })();
