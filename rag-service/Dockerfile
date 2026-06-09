@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY rag-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 预下载 ChromaDB ONNX Embedding 模型，避免首次请求超时
+RUN python -c "from chromadb.utils.embedding_functions import DefaultEmbeddingFunction; DefaultEmbeddingFunction()(['test'])"
+
 COPY rag-service/ .
 
 RUN mkdir -p /app/data /app/logs /app/chroma_db
