@@ -3,9 +3,11 @@
  * 统一管理所有 API 请求，支持流式 (SSE) 和普通请求
  */
 
-import type { ChatResponse, Conversation, SSETokenEvent } from "@/types/chat";
+import type { ChatResponse, Conversation, Message, SSETokenEvent } from "@/types/chat";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// In Sealos: relative URL → Next.js rewrites proxy to backend internally (no CORS needed).
+// For external backends: set NEXT_PUBLIC_API_URL env var → start.sh replaces the placeholder.
+const API_BASE = "{{NEXT_PUBLIC_API_URL}}";
 
 class ApiClient {
   private baseUrl: string;
@@ -60,7 +62,7 @@ class ApiClient {
   }
 
   /** 获取会话详情 */
-  async getConversation(id: string): Promise<Conversation & { messages: unknown[] }> {
+  async getConversation(id: string): Promise<Conversation & { messages: Message[] }> {
     return this.request(`/api/conversations/${id}`);
   }
 

@@ -1,19 +1,6 @@
 """
-=============================================================================
-DeepService 对话管理 — 路由决策模块 (Router)
-=============================================================================
-职责：
-  1. 意图 → 处理策略的路由映射
-  2. 多意图时的任务编排（并行/串行处理）
-  3. 置信度不足时的兜底策略
-  4. 处理结果聚合
-
-企业级设计原则：
-  - 每个意图有明确的路由目标（RAG检索 / 规则应答 / 转人工 / 结构化流程）
-  - 意图路由器是对话系统的"交通指挥"
-  - 低置信度意图自动降级或追问
-  - 支持处理策略链（如：先检索 → 置信度不够 → 追问 → 仍不够 → 转人工）
-=============================================================================
+Router: maps intents to processing strategies, handles multi-intent orchestration,
+and applies fallback chains when confidence is low.
 """
 
 from dataclasses import dataclass, field
@@ -32,28 +19,26 @@ from dialogue_state import (
 )
 
 
-# ============================================================================
-# 路由策略定义
-# ============================================================================
+# [[[ Route action & decision ]]]
 class RouteAction(str, Enum):
-    """路由动作"""
-    RAG_RETRIEVAL = "rag_retrieval"           # RAG 检索生成
-    RAG_ORDER_LOOKUP = "rag_order_lookup"     # RAG + 订单数据查询
-    RULE_RESPONSE = "rule_response"           # 规则直接回复（固定话术）
-    STRUCTURED_FLOW = "structured_flow"       # 启动结构化流程（退换货等）
-    TRANSFER_HUMAN = "transfer_human"         # 转人工
-    CLARIFY = "clarify"                       # 追问澄清
-    LLM_DIRECT = "llm_direct"                 # 直接 LLM 回答（无 RAG）
-    MULTI_STEP = "multi_step"                 # 多步骤处理
+    """Routing actions"""
+    RAG_RETRIEVAL = "rag_retrieval"           # RAG retrieval + generation
+    RAG_ORDER_LOOKUP = "rag_order_lookup"     # RAG + order data lookup
+    RULE_RESPONSE = "rule_response"           # fixed script response
+    STRUCTURED_FLOW = "structured_flow"       # start structured flow (returns etc.)
+    TRANSFER_HUMAN = "transfer_human"         # transfer to human agent
+    CLARIFY = "clarify"                       # ask for clarification
+    LLM_DIRECT = "llm_direct"                 # direct LLM answer (no RAG)
+    MULTI_STEP = "multi_step"                 # multi-step processing
 
 
 @dataclass
 class RouteDecision:
-    """路由决策"""
+    """A single routing decision"""
     intent: IntentCategory
     action: RouteAction
-    priority: int = 0                         # 处理优先级（数字越小越优先）
-    confidence_threshold: float = 0.50        # 触发此路由的最低置信度
+    priority: int = 0                         # lower = higher priority
+    confidence_threshold: float = 0.50
     metadata: Dict = field(default_factory=dict)
 
     def to_dict(self) -> Dict:
@@ -66,19 +51,14 @@ class RouteDecision:
         }
 
 
-# ============================================================================
-# 意图路由表
-# ============================================================================
+# [[[ Intent routing table ]]]
 class IntentRouter:
     """
-    意图路由器
-
-    核心路由表：意图 → 处理策略的映射
+    Maps intents to processing strategies via a routing table.
     """
 
-    # 路由表定义
     ROUTE_TABLE: Dict[IntentCategory, RouteDecision] = {
-        # ──── RAG 检索类 ────
+        # --- RAG retrieval ---
         IntentCategory.PRODUCT_INQUIRY: RouteDecision(
             intent=IntentCategory.PRODUCT_INQUIRY,
             action=RouteAction.RAG_RETRIEVAL,
@@ -112,7 +92,7 @@ class IntentRouter:
             metadata={"suggest_transfer_on_low_confidence": True},
         ),
 
-        # ──── RAG + 数据查询类 ────
+        # --- RAG + order lookup ---
         IntentCategory.ORDER_STATUS: RouteDecision(
             intent=IntentCategory.ORDER_STATUS,
             action=RouteAction.RAG_ORDER_LOOKUP,
@@ -134,7 +114,7 @@ class IntentRouter:
             confidence_threshold=0.50,
         ),
 
-        # ──── 结构化流程类 ────
+        # --- Structured flows ---
         IntentCategory.RETURN_EXCHANGE: RouteDecision(
             intent=IntentCategory.RETURN_EXCHANGE,
             action=RouteAction.STRUCTURED_FLOW,
@@ -143,11 +123,11 @@ class IntentRouter:
             metadata={"flow_type": FlowType.RETURN_EXCHANGE},
         ),
 
-        # ──── 转人工类 ────
+        # --- Transfer to human ---
         IntentCategory.TRANSFER_HUMAN: RouteDecision(
             intent=IntentCategory.TRANSFER_HUMAN,
             action=RouteAction.TRANSFER_HUMAN,
-            priority=0,                       # 最高优先级
+            priority=0,                       # highest priority
             confidence_threshold=0.70,
             metadata={"trigger": "user_requested"},
         ),
@@ -159,7 +139,7 @@ class IntentRouter:
             metadata={"trigger": "complaint_detected"},
         ),
 
-        # ──── 规则应答类 ────
+        # --- Rule-based responses ---
         IntentCategory.GREETING: RouteDecision(
             intent=IntentCategory.GREETING,
             action=RouteAction.RULE_RESPONSE,
@@ -167,7 +147,7 @@ class IntentRouter:
             confidence_threshold=0.80,
         ),
 
-        # ──── 追问澄清类 ────
+        # --- Clarification ---
         IntentCategory.CLARIFICATION: RouteDecision(
             intent=IntentCategory.CLARIFICATION,
             action=RouteAction.CLARIFY,
@@ -175,7 +155,7 @@ class IntentRouter:
             confidence_threshold=0.30,
         ),
 
-        # ──── 兜底类 ────
+        # --- Fallback ---
         IntentCategory.UNKNOWN: RouteDecision(
             intent=IntentCategory.UNKNOWN,
             action=RouteAction.CLARIFY,
@@ -199,11 +179,11 @@ class IntentRouter:
             action=RouteAction.RAG_RETRIEVAL,
             priority=1,
             confidence_threshold=0.50,
-            metadata={"suggest_transfer": True},  # 账号问题最终需要人工
+            metadata={"suggest_transfer": True},  # account issues typically need human review
         ),
     }
 
-    # 规则应答模板
+    # Rule-based response templates
     RULE_RESPONSES: Dict[IntentCategory, str] = {
         IntentCategory.GREETING: (
             "您好！我是 DeepService 智能客服助手 👋\n\n"
@@ -220,7 +200,7 @@ class IntentRouter:
     def __init__(self):
         self.recognizer = get_intent_recognizer()
         self.state_tracker = get_dialogue_state_tracker()
-        logger.info("[IntentRouter] 路由器初始化完成")
+        logger.info("[IntentRouter] Router initialized")
 
     def route(
         self,
@@ -228,10 +208,8 @@ class IntentRouter:
         session_id: str = "",
     ) -> List[RouteDecision]:
         """
-        对识别结果进行路由决策
-
-        返回按优先级排列的路由决策列表。
-        多意图时返回多个决策。
+        Produce routing decisions for recognition results, sorted by priority.
+        Returns multiple decisions for multi-intent results.
         """
         decisions = []
 
@@ -241,11 +219,11 @@ class IntentRouter:
             if decision:
                 decisions.append(decision)
 
-        # 按优先级排序
+        # Sort by priority
         decisions.sort(key=lambda d: d.priority)
 
         logger.info(
-            f"[IntentRouter] 路由决策: "
+            f"[IntentRouter] Route decisions: "
             f"{[(d.intent.value, d.action.value) for d in decisions]}"
         )
 
@@ -253,25 +231,23 @@ class IntentRouter:
 
     def route_single(self, recognition_result: RecognitionResult) -> RouteAction:
         """
-        单意图路由 — 返回最高优先级的动作
-
-        用于大多数单意图场景。
+        Single-intent routing — returns the top-priority action.
         """
         decisions = self.route(recognition_result)
         if decisions:
             return decisions[0].action
-        return RouteAction.CLARIFY  # 兜底
+        return RouteAction.CLARIFY  # ultimate fallback
 
     def _decide_for_intent(
         self,
         intent_result: IntentResult,
         session_id: str,
     ) -> Optional[RouteDecision]:
-        """为单个意图做路由决策"""
+        """Decide routing for a single intent"""
         intent = intent_result.intent
         confidence = intent_result.confidence
 
-        # 查找路由表
+        # Look up in route table
         base_decision = self.ROUTE_TABLE.get(intent)
         if base_decision is None:
             base_decision = self.ROUTE_TABLE[IntentCategory.UNKNOWN]
@@ -284,7 +260,7 @@ class IntentRouter:
             metadata=dict(base_decision.metadata),
         )
 
-        # 置信度不足 → 降级策略
+        # Low confidence -> apply fallback
         if confidence < decision.confidence_threshold:
             decision = self._apply_fallback_strategy(decision, confidence, session_id)
 
@@ -297,20 +273,15 @@ class IntentRouter:
         session_id: str,
     ) -> RouteDecision:
         """
-        置信度不足时的降级策略
-
-        降级链:
-          RAG_RETRIEVAL → CLARIFY（追问一次）
-          CLARIFY（再次失败） → TRANSFER_HUMAN
+        Fallback chain: RAG_RETRIEVAL -> CLARIFY (twice) -> TRANSFER_HUMAN.
         """
-        # 检查该会话的追问次数
         clarify_count = self._get_clarify_count(session_id)
 
         if clarify_count < 2:
-            # 第一次/第二次：追问澄清
+            # First/second attempt: ask for clarification
             logger.info(
-                f"[IntentRouter] 置信度不足 ({confidence:.2f} < {decision.confidence_threshold})"
-                f"，降级为追问澄清（第{clarify_count + 1}次）"
+                f"[IntentRouter] Low confidence ({confidence:.2f} < {decision.confidence_threshold})"
+                f", downgrading to clarify (attempt {clarify_count + 1})"
             )
             return RouteDecision(
                 intent=decision.intent,
@@ -324,14 +295,14 @@ class IntentRouter:
                 },
             )
         else:
-            # 两次追问仍不足 → 转人工
+            # Still unclear after two attempts -> transfer to human
             logger.info(
-                f"[IntentRouter] 已追问{clarify_count}次仍不明确，降级为转人工"
+                f"[IntentRouter] Still unclear after {clarify_count} clarify attempts, transferring to human"
             )
             return RouteDecision(
                 intent=decision.intent,
                 action=RouteAction.TRANSFER_HUMAN,
-                priority=0,  # 最高优先级
+                priority=0,  # highest priority
                 confidence_threshold=0.0,
                 metadata={
                     "original_action": decision.action.value,
@@ -341,9 +312,9 @@ class IntentRouter:
             )
 
     def _get_clarify_count(self, session_id: str) -> int:
-        """获取会话的追问次数"""
-        # 简化实现：从状态跟踪器获取
-        # 生产环境从 Redis 获取
+        """Get clarification attempt count for a session"""
+        # Simplified: pull from state tracker
+        # TODO: pull from Redis when integrating session store
         try:
             status = self.state_tracker.get_status(session_id)
             return status.get("clarify_count", 0)
@@ -354,9 +325,7 @@ class IntentRouter:
         self,
         recognition_result: RecognitionResult,
     ) -> Dict:
-        """
-        获取路由摘要 — 用于日志和调试
-        """
+        """Return routing summary for logging/debugging"""
         decisions = self.route(recognition_result)
         return {
             "is_multi_intent": recognition_result.is_multi_intent,
@@ -366,29 +335,25 @@ class IntentRouter:
         }
 
 
-# ============================================================================
-# 路由执行器 — 实际调用对应的处理模块
-# ============================================================================
+# [[[ Route executor ]]]
 class RouteExecutor:
     """
-    路由执行器
-
-    根据路由决策，实际调用对应的处理器。
+    Executes routing decisions by dispatching to registered handlers.
     """
 
     def __init__(self):
         self.router = IntentRouter()
         self.state_tracker = get_dialogue_state_tracker()
 
-        # 处理函数注册表
+        # Handler registry
         self._handlers: Dict[RouteAction, Callable] = {}
 
-        logger.info("[RouteExecutor] 初始化完成")
+        logger.info("[RouteExecutor] Initialized")
 
     def register_handler(self, action: RouteAction, handler: Callable):
-        """注册自定义处理器"""
+        """Register a custom handler for an action"""
         self._handlers[action] = handler
-        logger.info(f"[RouteExecutor] 注册处理器: {action.value}")
+        logger.info(f"[RouteExecutor] Handler registered: {action.value}")
 
     def execute(
         self,
@@ -398,10 +363,7 @@ class RouteExecutor:
         **context,
     ) -> Dict:
         """
-        执行路由决策
-
-        返回处理结果。
-        context 可传入：retrieval_service, generator, defense_system 等依赖
+        Execute routing decisions. context may include retrieval_service, generator, etc.
         """
         decisions = self.router.route(recognition_result, session_id)
 
@@ -411,7 +373,7 @@ class RouteExecutor:
                 "message": "无法确定如何处理您的请求，请尝试换个方式描述。",
             }
 
-        # 按优先级处理
+        # Process in priority order
         results = []
         for decision in decisions:
             handler = self._handlers.get(decision.action)
@@ -426,21 +388,21 @@ class RouteExecutor:
                     )
                     results.append(result)
                 except Exception as e:
-                    logger.error(f"[RouteExecutor] 处理器 {decision.action.value} 执行失败: {e}")
+                    logger.error(f"[RouteExecutor] Handler {decision.action.value} failed: {e}")
                     results.append({
                         "status": "error",
                         "action": decision.action.value,
                         "error": str(e),
                     })
             else:
-                logger.warning(f"[RouteExecutor] 未注册的处理器: {decision.action.value}")
+                logger.warning(f"[RouteExecutor] Unregistered handler: {decision.action.value}")
                 results.append({
                     "status": "unhandled",
                     "action": decision.action.value,
-                    "message": f"处理器 {decision.action.value} 未注册",
+                    "message": f"Handler {decision.action.value} not registered",
                 })
 
-        # 聚合结果
+        # Aggregate results
         return self._aggregate_results(results, decisions[0])
 
     def _aggregate_results(
@@ -448,14 +410,14 @@ class RouteExecutor:
         results: List[Dict],
         primary_decision: RouteDecision,
     ) -> Dict:
-        """聚合多个处理器的结果"""
+        """Merge results from multiple handlers"""
         if not results:
             return {"status": "error", "message": "无处理结果"}
 
         if len(results) == 1:
             return results[0]
 
-        # 多意图处理结果拼接
+        # Concatenate multi-intent results
         messages = [r.get("message", "") for r in results if r.get("message")]
         return {
             "status": "multi_intent_processed",
@@ -465,14 +427,10 @@ class RouteExecutor:
         }
 
 
-# ============================================================================
-# 内置处理器实现
-# ============================================================================
+# [[[ Built-in handlers ]]]
 def build_default_handlers() -> Dict[RouteAction, Callable]:
     """
-    构建默认处理器字典
-
-    返回可直接注册到 RouteExecutor 的处理器映射。
+    Build the default handler map for RouteExecutor registration.
     """
     handlers = {}
 
@@ -519,45 +477,29 @@ def build_default_handlers() -> Dict[RouteAction, Callable]:
     return handlers
 
 
-# ============================================================================
-# 全局单例
-# ============================================================================
-import threading
-
 _router: Optional[IntentRouter] = None
 _executor: Optional[RouteExecutor] = None
-_lock = threading.Lock()
 
 
 def get_router() -> IntentRouter:
     global _router
     if _router is None:
-        with _lock:
-            if _router is None:
-                _router = IntentRouter()
+        _router = IntentRouter()
     return _router
 
 
 def get_route_executor() -> RouteExecutor:
     global _executor
     if _executor is None:
-        with _lock:
-            if _executor is None:
-                _executor = RouteExecutor()
-                # 注册默认处理器
-                for action, handler in build_default_handlers().items():
-                    _executor.register_handler(action, handler)
+        _executor = RouteExecutor()
+        for action, handler in build_default_handlers().items():
+            _executor.register_handler(action, handler)
     return _executor
 
 
-# ============================================================================
-# 独立测试
-# ============================================================================
+# [[[ Self-check ]]]
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("DeepService Router — 独立测试")
-    logger.info("=" * 60)
-
+    logger.info("Router self-check")
     recognizer = get_intent_recognizer()
     router = get_router()
 
@@ -566,20 +508,17 @@ if __name__ == "__main__":
         "我要退货",
         "你好",
         "你们太差了我要投诉",
-        "asdfghjkl",  # 无意义
+        "asdfghjkl",
     ]
 
     for query in test_queries:
         result = recognizer.recognize(query)
         decisions = router.route(result)
-        logger.info(f"\n输入: '{query}'")
-        logger.info(f"  意图: {[i.intent.value for i in result.intents]}")
-        logger.info(f"  路由: {[(d.action.value, d.priority) for d in decisions]}")
+        logger.info(f"  '{query}' -> intent={[i.intent.value for i in result.intents]}, route={[(d.action.value, d.priority) for d in decisions]}")
 
-    # 测试路由摘要
+    # Route summary
     result = recognizer.recognize("我要退货，还要查订单")
     summary = router.get_routing_summary(result)
-    logger.info(f"\n路由摘要: {json.dumps(summary, ensure_ascii=False, indent=2)}")
+    logger.info(f"  Multi-intent summary: {json.dumps(summary, ensure_ascii=False)}")
 
-    logger.info("=" * 60)
-    logger.info("路由测试完成 ✓")
+    logger.info("Router self-check complete.")

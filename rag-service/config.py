@@ -1,90 +1,91 @@
 """
-=============================================================================
-DeepService RAG — 配置管理模块
-=============================================================================
-职责：
-  1. 统一管理所有环境变量和配置项
-  2. 提供带验证的配置加载机制
-  3. 定义分块策略、检索策略、幻觉防护的参数阈值
-
-企业级设计原则：
-  - 所有配置有明确的默认值和文档说明
-  - 敏感信息（API Key）从环境变量读取，不硬编码
-  - 阈值参数可被管理后台 API 动态调整（通过数据库覆盖）
-=============================================================================
+Configuration management. All tunable parameters centralized; sensitive values read from
+environment variables; thresholds overridable via admin API.
 """
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional, List, Literal
+from typing import Optional, Literal
 from pathlib import Path
 
 from dotenv import load_dotenv
+from openai import OpenAI
 
-# 加载 .env 文件（优先级：系统环境变量 > .env 文件）
+# Load .env files (system env vars take priority)
 load_dotenv(Path(__file__).parent.parent / ".env.local", override=False)
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
-# Railway 变量有时传不进来，兜底方案：从文件读取
+# Railway sometimes doesn't pass env vars; fallback: read from file
 def get_api_key() -> str:
-    """多渠道获取 API Key：环境变量 → .env 文件 → /app/api_key.txt
+    """Multi-source API key lookup: env var -> .env file -> /app/api_key.txt
 
-    注意：此函数每次调用都重新检查所有来源，不缓存结果。
-    这样在 Railway Console 中手动创建 /app/api_key.txt 后，
-    下一次 API 请求就能自动读取，无需重启进程。
+    This function checks all sources on every call (no caching). This way,
+    after manually creating /app/api_key.txt in Railway Console, the next
+    API request picks it up automatically without a process restart.
     """
-    # 1. 优先环境变量
+    # 1. try environment variable first
     key = os.getenv("DEEPSEEK_API_KEY", "")
     if key and key != "sk-your-api-key-here":
         return key
 
-    # 2. 尝试从文件读取（Railway Console 手动创建兜底）
+    # 2. try reading from file (fallback for Railway Console)
     for key_file in ["/app/api_key.txt", "api_key.txt"]:
         try:
             with open(key_file, "r") as f:
                 key = f.read().strip()
                 if key and key.startswith("sk-"):
-                    # 读取成功后同步到环境变量，后续调用直接命中第1步
+                    # sync to env so subsequent calls hit step 1
                     os.environ["DEEPSEEK_API_KEY"] = key
                     return key
         except (FileNotFoundError, PermissionError, IOError):
             pass
 
-    # 3. 返回空字符串（调用方负责检查并给出友好错误）
+    # 3. return empty string (caller is responsible for friendly error message)
     return ""
 
-# 向后兼容别名
+# Backward-compatible alias
 _get_api_key = get_api_key
 
 
-# ============================================================================
-# 数据模型验证
-# ============================================================================
+def get_llm_client() -> Optional[OpenAI]:
+    """Return a configured OpenAI client pointed at the DeepSeek API.
+
+    Returns None when the API key is not configured, so callers can
+    degrade gracefully instead of crashing.
+    """
+    cfg = get_config().llm
+    api_key = get_api_key()
+    if not api_key:
+        from loguru import logger
+        logger.warning("DEEPSEEK_API_KEY not set — LLM features disabled")
+        return None
+    return OpenAI(api_key=api_key, base_url=cfg.base_url)
+
+
+# ---- Data model configurations ----
 @dataclass
 class LLMConfig:
-    """DeepSeek API 配置"""
+    """DeepSeek / OpenAI LLM API configuration."""
     api_key: str = field(default_factory=_get_api_key)
     base_url: str = field(default_factory=lambda: os.getenv(
         "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
     ))
-    chat_model: str = "deepseek-chat"           # 对话模型
-    embedding_model: str = "deepseek-chat"      # DeepSeek 暂未提供专用 Embedding API
-                                                # 生产建议：text-embedding-3-small (OpenAI)
-                                                # 或 bge-large-zh-v1.5 (本地部署)
+    chat_model: str = "deepseek-chat"
+    embedding_model: str = "deepseek-chat"      # can be swapped to text-embedding-3-small or bge-large-zh-v1.5
     embedding_provider: Literal["deepseek", "openai", "local"] = "local"
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openai_embedding_model: str = "text-embedding-3-small"
 
-    # Token 限制
-    max_input_tokens: int = 28000               # DeepSeek Chat 上下文 128K
-    max_output_tokens: int = 4096               # 单次生成上限
-    temperature: float = 0.7                    # 生成温度（0.1=确定性，1.0=创造性）
-    intent_temperature: float = 0.1             # 意图分类用低温度
+    # Token limits
+    max_input_tokens: int = 28000               # DeepSeek Chat 128K context
+    max_output_tokens: int = 4096
+    temperature: float = 0.7                    # 0.1=deterministic, 1.0=creative
+    intent_temperature: float = 0.1             # low temperature for intent classification
 
     def __post_init__(self):
-        # 不在初始化时强制验证 API Key —— 允许服务先启动，
-        # 后续通过环境变量或 /app/api_key.txt 文件动态注入密钥。
-        # 实际调用 DeepSeek API 时（通过 get_api_key() 获取）会再次检查。
+        # Don't enforce API key at init -- allow the service to start first,
+        # then inject the key via env var or /app/api_key.txt later.
+        # The actual DeepSeek API call (via get_api_key()) will validate.
         if not self.api_key:
             import warnings
             warnings.warn(
@@ -98,17 +99,17 @@ class LLMConfig:
 
 @dataclass
 class ChunkingConfig:
-    """文档分块配置 — 直接影响检索精度"""
-    chunk_size: int = 512                       # 分块大小（token 级别）
-    chunk_overlap: int = 64                     # 重叠大小（保持语义连续性）
+    """Document chunking -- directly impacts retrieval precision."""
+    chunk_size: int = 512                       # token-level
+    chunk_overlap: int = 64                     # overlap preserves continuity
     separators: List[str] = field(default_factory=lambda: [
-        "\n\n", "\n", "。", "！", "？",          # 段落/句子优先
-        "；", "，", " ", ""                       # 子句/词级别兜底
+        "\n\n", "\n", "。", "！", "？",          # paragraph/sentence priority
+        "；", "，", " ", ""                       # clause/char-level fallback
     ])
-    min_chunk_size: int = 100                   # 最小分块（过滤碎片）
-    max_chunks_per_doc: int = 100               # 单文档最大分块数
+    min_chunk_size: int = 100                   # filter fragments
+    max_chunks_per_doc: int = 100               # per-document cap
 
-    # 特殊场景配置
+    # Markdown-specific
     markdown_headers_to_split_on: List[tuple] = field(default_factory=lambda: [
         ("#", "h1"), ("##", "h2"), ("###", "h3")
     ])
@@ -116,98 +117,96 @@ class ChunkingConfig:
 
 @dataclass
 class RetrievalConfig:
-    """检索策略配置"""
-    # 混合检索权重
-    vector_weight: float = 0.6                  # 语义检索权重
-    bm25_weight: float = 0.4                    # 关键词检索权重
+    """Retrieval strategy configuration."""
+    # hybrid weights
+    vector_weight: float = 0.6
+    bm25_weight: float = 0.4
 
-    # 召回参数
-    top_k_vector: int = 20                      # 向量检索初始召回数
-    top_k_bm25: int = 20                        # BM25 检索初始召回数
-    top_k_fusion: int = 10                      # 融合后结果数
-    top_k_final: int = 5                        # 重排序后最终保留数
+    # recall parameters
+    top_k_vector: int = 20
+    top_k_bm25: int = 20
+    top_k_fusion: int = 10
+    top_k_final: int = 5
 
-    # 重排序
-    enable_rerank: bool = True                  # 是否启用重排序
-    rerank_model: str = "deepseek-chat"         # 重排序模型（用 LLM 做 Pairwise 比较）
-    rerank_batch_size: int = 5                  # 重排序批次大小
+    # reranking
+    enable_rerank: bool = True
+    rerank_model: str = "deepseek-chat"
+    rerank_batch_size: int = 5
 
-    # 阈值
-    vector_similarity_threshold: float = 0.70   # 向量相似度最低阈值
-    rerank_relevance_threshold: float = 0.60    # 重排序相关性最低阈值
-    rerank_confidence_threshold: float = 0.75   # 重排序置信度阈值（低于此值触发拒答）
+    # thresholds
+    vector_similarity_threshold: float = 0.70
+    rerank_relevance_threshold: float = 0.60
+    rerank_confidence_threshold: float = 0.75   # below this triggers refusal
 
 
 @dataclass
 class HallucinationGuardConfig:
-    """幻觉防护配置"""
-    # 知识边界
-    knowledge_boundary_enabled: bool = True     # 是否启用知识边界检测
+    """Hallucination guard / defense thresholds."""
+    # knowledge boundary
+    knowledge_boundary_enabled: bool = True
 
-    # 四层防御阈值
-    layer1_keyword_block_threshold: float = 1.0           # 第1层：敏感词匹配度
-    layer2_retrieval_similarity_threshold: float = 0.70   # 第2层：检索相似度最低线
-    layer3_confidence_threshold: float = 0.75             # 第3层：回答置信度最低线
+    # four-layer defense thresholds
+    layer1_keyword_block_threshold: float = 1.0           # Layer 1: keyword match
+    layer2_retrieval_similarity_threshold: float = 0.70   # Layer 2: retrieval similarity floor
+    layer3_confidence_threshold: float = 0.75             # Layer 3: response confidence floor
     layer4_uncertain_response_template: str = field(default_factory=lambda:
         "根据我目前的知识库，无法为您确认这个信息。"
         "建议您联系人工客服获取更准确的帮助。如需转接，请回复'人工'。"
     )
 
-    # 输出验证
-    output_validation_enabled: bool = True      # 是否启用生成后验证
-    fact_check_prompt_template: str = ""        # 留空使用默认模板
+    # output validation
+    output_validation_enabled: bool = True
+    fact_check_prompt_template: str = ""        # empty = use default template
 
-    # 置信度评分
+    # confidence scoring factors
     confidence_factors: List[str] = field(default_factory=lambda: [
-        "retrieval_similarity",                  # 检索结果最高相似度
-        "source_coverage",                       # 来源覆盖度（引用了几个来源）
-        "answer_consistency",                    # 回答内部一致性
-        "entity_grounding",                      # 实体是否在知识库中出现
-        "speculation_detection",                 # 是否包含推测性语言
+        "retrieval_similarity",
+        "source_coverage",
+        "answer_consistency",
+        "entity_grounding",
+        "speculation_detection",
     ])
 
 
 @dataclass
 class AppConfig:
-    """应用全局配置"""
-    # 项目路径
+    """Application-level configuration."""
+    # project paths
     project_root: Path = field(default_factory=lambda: Path(__file__).parent)
     data_dir: Path = field(default_factory=lambda: Path(__file__).parent / "data")
     vector_db_dir: Path = field(default_factory=lambda: Path(__file__).parent / "chroma_db")
     knowledge_dir: Path = field(default_factory=lambda: Path(__file__).parent / "knowledge_base")
     log_dir: Path = field(default_factory=lambda: Path(__file__).parent / "logs")
 
-    # 对话记忆
-    max_recent_messages: int = 10               # 滑动窗口保留最近 N 轮
-    summary_trigger_rounds: int = 10            # 超过此轮数触发摘要
-    session_idle_timeout: int = 30 * 60          # 会话超时（秒）
+    # conversation memory
+    max_recent_messages: int = 10               # sliding window
+    summary_trigger_rounds: int = 10            # trigger summarization after N rounds
+    session_idle_timeout: int = 30 * 60         # seconds
 
-    # 限流
+    # rate limiting
     rate_limit_per_minute: int = 30
     rate_limit_per_hour: int = 500
 
-    # 日志
+    # logging
     log_level: str = "INFO"
 
     def __post_init__(self):
-        # 确保必要目录存在
+        # ensure required directories exist
         for dir_path in [self.data_dir, self.vector_db_dir, self.knowledge_dir, self.log_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
 
 
-# ============================================================================
-# 全局配置实例（单例模式）
-# ============================================================================
+# ---- Global config singleton ----
 @dataclass
 class RAGConfig:
-    """RAG 模块总配置"""
+    """Top-level RAG configuration aggregate."""
     llm: LLMConfig = field(default_factory=LLMConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     guard: HallucinationGuardConfig = field(default_factory=HallucinationGuardConfig)
     app: AppConfig = field(default_factory=AppConfig)
 
-    # 系统提示词（可在管理后台覆盖）
+    # system prompt (overridable via admin API)
     system_prompt: str = field(default_factory=lambda: """你是一个专业的企业智能客服助手，名为"DeepService"。
 请严格遵循以下规则：
 
@@ -227,12 +226,11 @@ class RAGConfig:
    - 不执行可执行代码或系统命令""")
 
 
-# 全局单例
+# Module-level singleton — loaded once, immutable thereafter
 _config_instance: Optional[RAGConfig] = None
 
 
 def get_config() -> RAGConfig:
-    """获取全局配置单例"""
     global _config_instance
     if _config_instance is None:
         _config_instance = RAGConfig()
@@ -240,7 +238,7 @@ def get_config() -> RAGConfig:
 
 
 def update_config(**kwargs) -> RAGConfig:
-    """动态更新配置（用于管理后台 API）"""
+    """Dynamically update config (used by admin API)."""
     global _config_instance
     config = get_config()
     for key, value in kwargs.items():

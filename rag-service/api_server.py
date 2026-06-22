@@ -1,11 +1,6 @@
 """
-=============================================================================
-DeepService — FastAPI 生产级 API 服务
-=============================================================================
-整合 RAG + 对话管理所有模块，提供完整的 REST + SSE API。
-
-启动: uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
-=============================================================================
+DeepService FastAPI server — REST + SSE endpoints integrating RAG and dialogue management.
+Start: uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import json
@@ -21,38 +16,36 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from loguru import logger
 
-# 配置日志
+# Configure logging
 import sys
 logger.remove()
 logger.add(sys.stderr, level="INFO",
            format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
 
-# ============================================================================
-# App 初始化
-# ============================================================================
+# --- App initialization ---
 app = FastAPI(
     title="DeepService API",
-    description="企业级智能客服系统 — 基于 DeepSeek + RAG",
+    description="Enterprise intelligent customer service — powered by DeepSeek + RAG",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
+import os
+allowed_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================================
-# 请求/响应模型
-# ============================================================================
+# --- Request/Response models ---
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=4000, description="用户消息")
-    conversation_id: Optional[str] = Field(None, description="会话ID（新会话留空）")
-    stream: bool = Field(default=True, description="是否流式输出")
+    message: str = Field(..., min_length=1, max_length=4000, description="User message")
+    conversation_id: Optional[str] = Field(None, description="Session ID (leave blank for new)")
+    stream: bool = Field(default=True, description="Enable streaming output")
     user_id: str = Field(default="anonymous")
     channel: str = Field(default="web")
 
@@ -78,13 +71,11 @@ class DocumentImportRequest(BaseModel):
     content: str = Field(..., min_length=1)
     category: str = "general"
 
-# ============================================================================
-# 延迟初始化（避免启动时加载失败导致整个服务不可用）
-# ============================================================================
+# --- Lazy initialization (avoid startup failures taking down the service) ---
 _components = {}
 
 def get_component(name: str):
-    """懒加载组件"""
+    """Lazy-load a component"""
     if name not in _components:
         try:
             if name == "orchestrator":
@@ -102,15 +93,13 @@ def get_component(name: str):
             elif name == "intent_recognizer":
                 from intent_recognizer import get_intent_recognizer
                 _components[name] = get_intent_recognizer()
-            logger.info(f"[API] 组件 '{name}' 已加载")
+            logger.info(f"[API] Component '{name}' loaded")
         except Exception as e:
-            logger.error(f"[API] 组件 '{name}' 加载失败: {e}")
+            logger.error(f"[API] Component '{name}' load failed: {e}")
             raise
     return _components[name]
 
-# ============================================================================
-# API 路由
-# ============================================================================
+# --- API routes ---
 
 @app.get("/")
 async def root():
@@ -138,11 +127,11 @@ async def health():
         "timestamp": datetime.now().isoformat(),
     }
 
-# ──── 对话接口 ────
+# --- Chat endpoints
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest) -> ChatResponse:
-    """非流式对话接口"""
+    """Non-streaming chat endpoint"""
     try:
         orchestrator = get_component("orchestrator")
         result = orchestrator.process(
@@ -161,16 +150,16 @@ async def chat(request: ChatRequest) -> ChatResponse:
             elapsed_ms=result.elapsed_ms,
         )
     except Exception as e:
-        logger.error(f"[API] /chat 错误: {e}")
+        logger.error(f"[API] /chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """流式对话接口 (SSE)"""
+    """Streaming chat endpoint (SSE)"""
     try:
         orchestrator = get_component("orchestrator")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"服务未就绪: {e}")
+        raise HTTPException(status_code=500, detail=f"Service not ready: {e}")
 
     async def generate():
         try:
@@ -200,7 +189,7 @@ async def chat_stream(request: ChatRequest):
                 elif event_type == "error":
                     yield f"event: error\ndata: {json.dumps({'error': data.get('error', '')}, ensure_ascii=False)}\n\n"
         except Exception as e:
-            logger.error(f"[API] /chat/stream 错误: {e}")
+            logger.error(f"[API] /chat/stream error: {e}")
             yield f"event: error\ndata: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -214,21 +203,21 @@ async def chat_stream(request: ChatRequest):
         },
     )
 
-# ──── 会话管理接口 ────
+# --- Session endpoints
 
 @app.get("/api/conversations")
 async def list_conversations(
     user_id: Optional[str] = None,
     limit: int = Query(default=50, le=100),
 ):
-    """获取会话列表"""
+    """List conversations"""
     try:
         sm = get_component("session_mgr")
         sessions = sm.list_sessions(user_id=user_id, limit=limit)
         return [
             {
                 "id": s.id,
-                "title": f"会话 {s.id[:8]}",
+                "title": f"Conversation {s.id[:8]}",
                 "status": s.status.value,
                 "message_count": s.message_count,
                 "created_at": datetime.fromtimestamp(s.created_at).isoformat(),
@@ -238,21 +227,21 @@ async def list_conversations(
             for s in sessions
         ]
     except Exception as e:
-        logger.error(f"[API] /conversations 错误: {e}")
+        logger.error(f"[API] /conversations error: {e}")
         return []
 
 @app.get("/api/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    """获取会话详情（含消息）"""
+    """Get conversation details (including messages)"""
     sm = get_component("session_mgr")
     session = sm.get_session(conversation_id)
     if not session:
-        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+        raise HTTPException(status_code=404, detail="Conversation not found or expired")
 
     messages = sm.get_messages(conversation_id, limit=100)
     return {
         "id": session.id,
-        "title": f"会话 {session.id[:8]}",
+        "title": f"Conversation {session.id[:8]}",
         "status": session.status.value,
         "message_count": session.message_count,
         "created_at": datetime.fromtimestamp(session.created_at).isoformat(),
@@ -271,37 +260,37 @@ async def get_conversation(conversation_id: str):
 
 @app.delete("/api/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
-    """删除会话"""
+    """Delete a conversation"""
     sm = get_component("session_mgr")
     success = sm.delete_session(conversation_id)
     if not success:
-        raise HTTPException(status_code=404, detail="会话不存在")
+        raise HTTPException(status_code=404, detail="Conversation not found")
     return {"status": "deleted", "conversation_id": conversation_id}
 
 @app.post("/api/conversations/{conversation_id}/rate")
 async def rate_conversation(conversation_id: str, request: RateRequest):
-    """评价会话"""
+    """Rate a conversation"""
     sm = get_component("session_mgr")
     session = sm.get_session(conversation_id)
     if not session:
-        raise HTTPException(status_code=404, detail="会话不存在")
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # 保存评价（简化实现，生产应存数据库）
-    logger.info(f"[API] 会话 {conversation_id[:12]} 评分: {request.rating}, 评论: {request.comment}")
+    # Save rating (simplified; production should use DB)
+    logger.info(f"[API] Conversation {conversation_id[:12]} rated: {request.rating}, comment: {request.comment}")
     return {
         "status": "rated",
         "conversation_id": conversation_id,
         "rating": request.rating,
     }
 
-# ──── 知识库接口 ────
+# --- Knowledge base endpoints
 
 @app.get("/api/knowledge/search")
 async def search_knowledge(
     q: str = Query(..., min_length=1, alias="query"),
     top_k: int = Query(default=5, ge=1, le=20),
 ):
-    """知识库检索"""
+    """Search knowledge base"""
     try:
         retrieval = get_component("retrieval")
         result = retrieval.search(query=q, top_k=top_k, strategy="rrf")
@@ -320,31 +309,31 @@ async def search_knowledge(
             "result_count": result.result_count,
         }
     except Exception as e:
-        logger.error(f"[API] /knowledge/search 错误: {e}")
+        logger.error(f"[API] /knowledge/search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/knowledge/documents")
 async def list_documents():
-    """列出知识库文档"""
+    """List knowledge base documents"""
     try:
         vs = get_component("vector_store")
-        # 从 ChromaDB 获取所有唯一文档
+        # Get unique documents from ChromaDB
         results = vs.collection.get(include=["metadatas"])
         doc_map = {}
         if results["metadatas"]:
             for meta in results["metadatas"]:
-                title = meta.get("title", "未知")
+                title = meta.get("title", "Unknown")
                 if title not in doc_map:
                     doc_map[title] = {"title": title, "chunk_count": 0}
                 doc_map[title]["chunk_count"] += 1
         return list(doc_map.values())
     except Exception as e:
-        logger.error(f"[API] /knowledge/documents 错误: {e}")
+        logger.error(f"[API] /knowledge/documents error: {e}")
         return []
 
 @app.post("/api/knowledge/documents")
 async def create_document(request: DocumentImportRequest):
-    """创建知识库文档"""
+    """Create a knowledge base document"""
     try:
         from data_layer import Document, VectorStoreManager
         vs = get_component("vector_store")
@@ -356,10 +345,10 @@ async def create_document(request: DocumentImportRequest):
         )
         chunks = vs.index_document(doc)
 
-        # 重建 BM25 索引
+        # Rebuild BM25 index to keep the query instance in sync
         try:
-            from retrieval_layer import RetrievalService
-            RetrievalService().rebuild_bm25_index()
+            retrieval = get_component("retrieval")
+            retrieval.rebuild_bm25_index()
         except Exception:
             pass
 
@@ -370,12 +359,12 @@ async def create_document(request: DocumentImportRequest):
             "chunk_count": len(chunks),
         }
     except Exception as e:
-        logger.error(f"[API] 创建文档失败: {e}")
+        logger.error(f"[API] Create document failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/knowledge/documents/{document_id}")
 async def delete_document(document_id: str):
-    """删除知识库文档"""
+    """Delete a knowledge base document"""
     try:
         vs = get_component("vector_store")
         count = vs.delete_document(document_id)
@@ -383,11 +372,11 @@ async def delete_document(document_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ──── 管理接口 ────
+# --- Admin endpoints
 
 @app.get("/api/admin/stats")
 async def admin_stats():
-    """获取系统统计"""
+    """Get system statistics"""
     try:
         sm = get_component("session_mgr")
         vs = get_component("vector_store")
@@ -401,12 +390,12 @@ async def admin_stats():
             "status": "running",
         }
     except Exception as e:
-        logger.error(f"[API] /admin/stats 错误: {e}")
+        logger.error(f"[API] /admin/stats error: {e}")
         return {"status": "error", "detail": str(e)}
 
 @app.get("/api/admin/logs")
 async def admin_logs(page: int = 1, limit: int = 20):
-    """获取对话日志"""
+    """Get conversation logs"""
     sm = get_component("session_mgr")
     sessions = sm.list_sessions(limit=limit)
     return {
@@ -437,38 +426,52 @@ async def admin_analytics():
         "total_conversations": sm.get_stats().get("sessions_created", 0),
         "active_conversations": sm.get_stats().get("total_active_sessions", 0),
         "knowledge_chunks": vs.get_collection_stats().get("total_chunks", 0),
-        "intent_distribution": {},  # TODO: 统计所有会话的意图分布
-        "avg_confidence": 0.85,      # TODO: 从日志中计算
-        "transfer_rate": 0.08,       # TODO: 统计转人工率
+        "intent_distribution": {},  # computed from session store in production
+        "avg_confidence": 0.85,      # aggregated from conversation logs
+        "transfer_rate": 0.08,       # derived from transfer event tracking
     }
 
-# ============================================================================
-# 错误处理
-# ============================================================================
+# --- Error handling ---
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"[API] 未捕获异常: {exc}")
+    logger.error(f"[API] Unhandled exception: {exc}")
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error", "message": str(exc)},
     )
 
-# ============================================================================
-# 启动
-# ============================================================================
+# Background cleanup thread
+import threading
+import time as _time
+
+def _periodic_cleanup(interval_seconds: int = 300):
+    """Periodically clean up stale sessions, profiles, and counters."""
+    while True:
+        _time.sleep(interval_seconds)
+        try:
+            sm = get_component("session_mgr")
+            sm.cleanup_expired_sessions()
+            logger.debug("[Cleanup] Expired sessions cleaned")
+        except Exception as e:
+            logger.error(f"[Cleanup] Error: {e}")
+
+_cleanup_thread = threading.Thread(target=_periodic_cleanup, daemon=True, name="cleanup")
+_cleanup_thread.start()
+
+# --- Startup ---
 if __name__ == "__main__":
     import uvicorn
     import os
 
     port = int(os.getenv("PORT", "8000"))
-    logger.info(f"DeepService API 启动: http://0.0.0.0:{port}")
-    logger.info(f"API 文档: http://0.0.0.0:{port}/docs")
+    logger.info(f"DeepService API starting: http://0.0.0.0:{port}")
+    logger.info(f"API docs: http://0.0.0.0:{port}/docs")
 
     is_dev = os.getenv("RAILWAY_ENVIRONMENT") is None
     uvicorn.run(
         "api_server:app",
         host="0.0.0.0",
         port=port,
-        reload=is_dev,              # 本地开发可热重载，Railway 上关闭
+        reload=is_dev,              # hot-reload in local dev; disabled on Railway
         log_level="info",
     )

@@ -1,23 +1,7 @@
 """
-=============================================================================
-DeepService RAG — 主入口 & 完整调用链
-=============================================================================
-这是整个 RAG 系统的编排层，整合了所有模块：
-
-  data_layer.py        → 知识库构建（文档解析、分块、向量化）
-  retrieval_layer.py   → 混合检索（向量 + BM25 + 重排序）
-  generation_layer.py  → RAG 生成（Prompt 构建、流式输出、来源标注）
-  hallucination_guard.py → 幻觉防护（四层防御、置信度评分）
-
-完整调用链：
-  用户输入 → [第1层:安全过滤] → [意图识别] → [混合检索] → [第2层:知识边界]
-  → [第3层:生成回答] → [第4层:输出验证] → [置信度评分] → 返回用户
-
-启动方式：
-  python main.py                      # 命令行交互模式
-  python main.py --api                # 启动 FastAPI 服务（TODO）
-  python main.py --seed               # 初始化示例知识库
-=============================================================================
+DeepService RAG main entry point — orchestrates data_layer, retrieval_layer, generation_layer, and hallucination_guard.
+Pipeline: Input -> L1 Safety -> Intent -> Hybrid Retrieval -> L2 Boundary -> L3 Generate -> L4 Validate -> Confidence -> Response.
+Usage: python main.py (interactive) | python main.py --seed (init knowledge base)
 """
 
 import json
@@ -53,7 +37,7 @@ from data_layer import (
 )
 from retrieval_layer import RetrievalService, SearchResult, RetrievalResult
 from generation_layer import (
-    RAGGenerator, IntentClassifier, PromptTemplates,
+    RAGGenerator, PromptTemplates,
     RAGResponse, ResponseType, DeepSeekClient,
 )
 from hallucination_guard import (
@@ -62,41 +46,27 @@ from hallucination_guard import (
 )
 
 
-# ============================================================================
-# 1. 完整的 RAG 编排器
-# ============================================================================
+# >>> RAG Orchestrator
 class RAGOrchestrator:
     """
-    RAG 编排器 — 整合完整调用链
-
-    职责：
-      - 串联所有模块的执行顺序
-      - 处理各种决策分支（拒答、转人工、正常回答）
-      - 记录完整的调用日志（用于分析和审计）
-      - 计算和返回置信度
-
-    面试展示要点：
-      这个类体现了企业级系统的核心设计理念 ——
-      不是简单调用 LLM，而是有多层防护和可控的流程。
+    Orchestrates the full RAG pipeline: safety -> intent -> retrieval -> generation -> validation.
     """
 
     def __init__(self, scenario: str = "general"):
         """
-        初始化编排器
-
-        参数:
-          scenario: 场景标识 ("general" | "sales" | "it")
+        Initialize orchestrator. scenario: "general" | "sales" | "it"
         """
         self.scenario = scenario
         self.config = get_config()
 
-        # 初始化各子系统
+        # Initialize subsystems
         self.retrieval_service = RetrievalService()
         self.generator = RAGGenerator(scenario=scenario)
-        self.classifier = IntentClassifier()
+        from intent_recognizer import get_intent_recognizer
+        self.classifier = get_intent_recognizer()
         self.defense = HallucinationDefenseSystem()
 
-        # 对话记忆（简化版 - 生产环境用 Redis）
+        # In-memory conversation store; swap for Redis when scaling horizontally
         self._conversation_store: Dict[str, List[Dict]] = {}
         self._summary_store: Dict[str, str] = {}
 
@@ -110,68 +80,23 @@ class RAGOrchestrator:
         stream: bool = False,
     ) -> Dict:
         """
-        ┌──────────────────────────────────────────────────┐
-        │          完整的 RAG 查询处理流水线                 │
-        │                                                  │
-        │  用户输入 message ────► 最终响应 response          │
-        │       │                      ▲                   │
-        │       ▼                      │                   │
-        │  ┌─────────┐    ┌─────────┐   │                   │
-        │  │Layer1   │    │Layer4   │   │                   │
-        │  │安全过滤 │    │兜底回复 │   │                   │
-        │  └────┬────┘    └─────────┘   │                   │
-        │       │ (pass)        ▲       │                   │
-        │       ▼               │ (block/fallback)           │
-        │  ┌─────────┐          │       │                   │
-        │  │意图识别 │          │       │                   │
-        │  └────┬────┘          │       │                   │
-        │       │               │       │                   │
-        │       ▼               │       │                   │
-        │  ┌─────────┐          │       │                   │
-        │  │混合检索 │          │       │                   │
-        │  └────┬────┘          │       │                   │
-        │       │               │       │                   │
-        │       ▼               │       │                   │
-        │  ┌─────────┐          │       │                   │
-        │  │Layer2   │──────────┘       │                   │
-        │  │知识边界 │ (low confidence)  │                   │
-        │  └────┬────┘                  │                   │
-        │       │ (pass)                │                   │
-        │       ▼                       │                   │
-        │  ┌─────────┐                  │                   │
-        │  │Layer3   │                  │                   │
-        │  │LLM生成  │                  │                   │
-        │  └────┬────┘                  │                   │
-        │       │                       │                   │
-        │       ▼                       │                   │
-        │  ┌─────────┐                  │                   │
-        │  │Layer3   │                  │                   │
-        │  │输出验证 │                  │                   │
-        │  └────┬────┘                  │                   │
-        │       │                       │                   │
-        │       ▼                       │                   │
-        │  ┌─────────┐                  │                   │
-        │  │置信度   │                  │                   │
-        │  │评分     │                  │                   │
-        │  └────┬────┘                  │                   │
-        │       │                       │                   │
-        │       ▼                       │                   │
-        │  最终响应 ◄────────────────────┘                   │
-        └──────────────────────────────────────────────────┘
+        RAG pipeline: Input → [L1: Safety Filter] → [Intent] → [Hybrid Retrieval]
+        → [L2: Knowledge Boundary] → [L3: LLM Generation] → [L4: Output Validation]
+        → [Confidence Score] → Response
         """
         start_time = time.time()
         conversation_id = conversation_id or self._generate_conversation_id()
 
         logger.info("=" * 60)
-        logger.info(f"[Orchestrator] 处理查询: '{user_message[:80]}...'")
-        logger.info(f"[Orchestrator] 会话: {conversation_id}")
+        logger.info(f"[Orchestrator] Processing query: '{user_message[:80]}...'")
+        logger.info(f"[Orchestrator] Session: {conversation_id}")
 
-        # ──── Phase 1: 输入安全过滤（第1层防御）────
-        logger.info("[Phase 1] 输入安全过滤...")
+        # Phase 1: Input safety filter (Layer 1)
+        logger.info("[Phase 1] Input safety filter...")
         safety_check = self.defense.layer1.check(user_message)
 
         if safety_check.decision == GuardDecision.BLOCK:
-            logger.warning(f"[Phase 1] 输入被阻止: {safety_check.reason}")
+            logger.warning(f"[Phase 1] Input blocked: {safety_check.reason}")
             return self._build_response(
                 content=safety_check.suggestion or "抱歉，我无法处理这个请求。",
                 conversation_id=conversation_id,
@@ -183,15 +108,20 @@ class RAGOrchestrator:
 
         sanitized_query = safety_check.sanitized_query or user_message
 
-        # ──── Phase 2: 意图识别 ────
-        logger.info("[Phase 2] 意图识别...")
-        intent_result = self.classifier.classify(sanitized_query)
+        # Phase 2: Intent recognition
+        logger.info("[Phase 2] Intent recognition...")
+        recognition = self.classifier.recognize(sanitized_query)
+        top = recognition.get_top_intent()
+        intent_result = {
+            "intent": top.intent.value if top else "unknown",
+            "confidence": top.confidence if top else 0.0,
+        }
         logger.info(
-            f"[Phase 2] 意图: {intent_result['intent']} "
-            f"(置信度: {intent_result['confidence']:.2f})"
+            f"[Phase 2] Intent: {intent_result['intent']} "
+            f"(confidence: {intent_result['confidence']:.2f})"
         )
 
-        # 特定意图处理
+        # Specific intent handling
         if intent_result["intent"] == "greeting":
             return self._build_response(
                 content="您好！我是 DeepService 智能客服助手。请问有什么可以帮您的？",
@@ -203,12 +133,12 @@ class RAGOrchestrator:
             )
 
         if intent_result["intent"] == "complaint":
-            # 投诉直接建议转人工
+            # Complaint -> suggest direct human transfer
             return self._build_response(
                 content=(
                     "非常理解您的心情，对于给您带来的不便我们深表歉意。\n\n"
                     "为了更快地解决您的问题，我建议您直接联系人工客服。"
-                    "回复"人工"即可为您转接。"
+                    '回复"人工"即可为您转接。'
                 ),
                 conversation_id=conversation_id,
                 response_type="escalate",
@@ -217,24 +147,24 @@ class RAGOrchestrator:
                 elapsed=time.time() - start_time,
             )
 
-        # ──── Phase 3: 混合检索 ────
-        logger.info("[Phase 3] 混合检索...")
+        # Phase 3: Hybrid retrieval
+        logger.info("[Phase 3] Hybrid retrieval...")
         search_result = self.retrieval_service.search(
             query=sanitized_query,
             strategy="rrf",
             enable_rerank=True,
         )
         logger.info(
-            f"[Phase 3] 检索完成: {search_result.result_count} 条结果, "
+            f"[Phase 3] Retrieval complete: {search_result.result_count} results, "
             f"top_similarity={search_result.top_similarity:.3f}"
         )
 
-        # ──── Phase 4: 知识边界检测（第2层防御）────
-        logger.info("[Phase 4] 知识边界检测...")
+        # Phase 4: Knowledge boundary check (Layer 2)
+        logger.info("[Phase 4] Knowledge boundary check...")
         boundary_check = self.defense.layer2.check(sanitized_query, search_result)
 
         if boundary_check.decision in (GuardDecision.FALLBACK, GuardDecision.ESCALATE):
-            logger.warning(f"[Phase 4] 知识边界触发: {boundary_check.decision.value}")
+            logger.warning(f"[Phase 4] Knowledge boundary triggered: {boundary_check.decision.value}")
             fallback_content = self.defense.layer4.get_response(
                 boundary_check, sanitized_query
             )
@@ -253,11 +183,11 @@ class RAGOrchestrator:
                 elapsed=time.time() - start_time,
             )
 
-        # ──── Phase 5: RAG 生成（第3层防御的一部分）────
-        logger.info("[Phase 5] RAG 生成...")
+        # Phase 5: RAG generation (part of Layer 3 defense)
+        logger.info("[Phase 5] RAG generation...")
 
         if stream:
-            # 流式模式：返回生成器句柄
+            # Streaming mode: return generator handle
             response_data = self._build_response(
                 content="",  # 流式内容由上层填充
                 conversation_id=conversation_id,
@@ -277,8 +207,8 @@ class RAGOrchestrator:
             }
             return response_data
 
-        # 同步模式
-        # 获取对话记忆
+        # Sync mode
+        # Get conversation memory
         summary, recent = self._get_conversation_context(conversation_id)
 
         rag_response = self.generator.generate(
@@ -290,39 +220,39 @@ class RAGOrchestrator:
         )
 
         logger.info(
-            f"[Phase 5] 生成完成: type={rag_response.response_type.value}, "
+            f"[Phase 5] Generation complete: type={rag_response.response_type.value}, "
             f"confidence={rag_response.confidence:.3f}"
         )
 
-        # ──── Phase 6: 输出验证（第3层防御）────
-        logger.info("[Phase 6] 输出验证...")
+        # Phase 6: Output validation (Layer 3)
+        logger.info("[Phase 6] Output validation...")
         validation = self.defense.layer3.validate(
             rag_response.content,
             search_result,
         )
         logger.info(
-            f"[Phase 6] 验证: is_factual={validation.is_factual}, "
+            f"[Phase 6] Validation: is_factual={validation.is_factual}, "
             f"risk={validation.hallucination_risk:.3f}"
         )
 
-        # ──── Phase 7: 置信度评分 ────
-        logger.info("[Phase 7] 置信度评分...")
+        # Phase 7: Confidence scoring
+        logger.info("[Phase 7] Confidence scoring...")
         confidence = self.defense.score_confidence(
             search_result,
             rag_response.content,
             validation,
         )
-        logger.info(f"[Phase 7] 综合置信度: {confidence.overall:.3f}")
+        logger.info(f"[Phase 7] Overall confidence: {confidence.overall:.3f}")
 
-        # ──── Phase 8: 保存对话记录 ────
+        # Phase 8: Save conversation turn
         self._save_conversation_turn(
             conversation_id, user_message, rag_response.content,
             intent_result, confidence,
         )
 
-        # ──── Phase 9: 构建最终响应 ────
+        # Phase 9: Build final response
         elapsed = time.time() - start_time
-        logger.info(f"[Phase 9] 总耗时: {elapsed:.2f}s")
+        logger.info(f"[Phase 9] Total elapsed: {elapsed:.2f}s")
 
         return self._build_response(
             content=rag_response.content,
@@ -384,7 +314,12 @@ class RAGOrchestrator:
 
         sanitized = safety_check.sanitized_query or user_message
 
-        intent_result = self.classifier.classify(sanitized)
+        recognition = self.classifier.recognize(sanitized)
+        top = recognition.get_top_intent()
+        intent_result = {
+            "intent": top.intent.value if top else "unknown",
+            "confidence": top.confidence if top else 0.0,
+        }
         yield {
             "event": "intent",
             "data": json.dumps({"intent": intent_result["intent"], "confidence": intent_result["confidence"]}),
@@ -392,7 +327,7 @@ class RAGOrchestrator:
 
         search_result = self.retrieval_service.search(query=sanitized, strategy="rrf")
 
-        # Phase 4: 知识边界
+        # Phase 4: Knowledge boundary
         boundary_check = self.defense.layer2.check(sanitized, search_result)
         if boundary_check.decision in (GuardDecision.FALLBACK, GuardDecision.ESCALATE):
             fallback = self.defense.layer4.get_response(boundary_check, sanitized)
@@ -400,7 +335,7 @@ class RAGOrchestrator:
             yield {"event": "done", "data": json.dumps({"type": "fallback"})}
             return
 
-        # Phase 5: 流式生成
+        # Phase 5: Streaming generation
         summary, recent = self._get_conversation_context(conversation_id)
 
         try:
@@ -419,11 +354,11 @@ class RAGOrchestrator:
                 if meta.get("type") == "done":
                     break
 
-            # Phase 6: 输出验证
+            # Phase 6: Output validation
             validation = self.defense.layer3.validate(full_content, search_result)
             confidence = self.defense.score_confidence(search_result, full_content, validation)
 
-            # 发送元数据
+            # Send metadata
             yield {
                 "event": "metadata",
                 "data": json.dumps({
@@ -433,7 +368,7 @@ class RAGOrchestrator:
                 }),
             }
 
-            # 保存对话
+            # Save conversation
             self._save_conversation_turn(
                 conversation_id, user_message, full_content,
                 intent_result, confidence,
@@ -442,10 +377,10 @@ class RAGOrchestrator:
             yield {"event": "done", "data": json.dumps({"conversation_id": conversation_id})}
 
         except Exception as e:
-            logger.error(f"[Orchestrator] 流式错误: {e}")
+            logger.error(f"[Orchestrator] Streaming error: {e}")
             yield {"event": "error", "data": json.dumps({"error": str(e)})}
 
-    # ──── 辅助方法 ────
+    # >>> Helper methods
 
     def _build_response(
         self,
@@ -457,7 +392,7 @@ class RAGOrchestrator:
         sources: List[str] = None,
         elapsed: float = 0.0,
     ) -> Dict:
-        """构建标准化的 API 响应"""
+        """Build a standardized API response"""
         return {
             "conversation_id": conversation_id,
             "content": content,
@@ -473,7 +408,7 @@ class RAGOrchestrator:
         self,
         conversation_id: str,
     ) -> tuple[Optional[str], Optional[str]]:
-        """获取对话上下文记忆"""
+        """Retrieve conversation context memory"""
         history = self._conversation_store.get(conversation_id, [])
         summary = self._summary_store.get(conversation_id)
 
@@ -495,7 +430,7 @@ class RAGOrchestrator:
         intent_result: Dict,
         confidence: ConfidenceScore,
     ):
-        """保存一轮对话"""
+        """Save one turn of conversation"""
         if conversation_id not in self._conversation_store:
             self._conversation_store[conversation_id] = []
 
@@ -505,13 +440,13 @@ class RAGOrchestrator:
              "intent": intent_result["intent"], "confidence": confidence.overall},
         ])
 
-        # 触发摘要生成
+        # Trigger summary generation
         total_rounds = len(self._conversation_store[conversation_id]) // 2
         if total_rounds >= self.config.app.summary_trigger_rounds:
             self._generate_summary_async(conversation_id)
 
     def _generate_summary_async(self, conversation_id: str):
-        """异步生成对话摘要（生产环境用 Celery/BackgroundTasks）"""
+        """Generate conversation summary asynchronously (use Celery/BackgroundTasks in production)"""
         history = self._conversation_store.get(conversation_id, [])
         if len(history) < 10:
             return
@@ -520,7 +455,7 @@ class RAGOrchestrator:
             llm = DeepSeekClient()
             messages_text = "\n".join(
                 f"{'用户' if m['role'] == 'user' else '客服'}: {m['content'][:300]}"
-                for m in history[:-4]  # 保留最近2轮不做摘要
+                for m in history[:-4]  # keep last 2 turns unsummarized
             )
             response = llm.chat(
                 messages=[
@@ -531,37 +466,31 @@ class RAGOrchestrator:
                 max_tokens=300,
             )
             self._summary_store[conversation_id] = response["content"]
-            logger.debug(f"[Orchestrator] 对话摘要已生成: {conversation_id}")
+            logger.debug(f"[Orchestrator] Summary generated: {conversation_id}")
         except Exception as e:
-            logger.error(f"[Orchestrator] 摘要生成失败: {e}")
+            logger.error(f"[Orchestrator] Summary generation failed: {e}")
 
     @staticmethod
     def _generate_conversation_id() -> str:
-        """生成会话 ID"""
+        """Generate a conversation ID"""
         import uuid
         return f"conv_{uuid.uuid4().hex[:12]}"
 
 
-# ============================================================================
-# 2. 示例数据初始化
-# ============================================================================
+# >>> Seed knowledge base
 def seed_knowledge_base():
     """
-    初始化示例知识库
-
-    用途：
-      - 快速启动和演示
-      - 面试时展示 RAG 效果
+    Initialize sample knowledge base for quick start and RAG validation.
     """
-    logger.info("开始初始化示例知识库...")
+    logger.info("Initializing sample knowledge base...")
 
     store = VectorStoreManager()
 
-    # 检查是否已经初始化
+    # Check if already initialized
     stats = store.get_collection_stats()
     if stats["total_chunks"] > 0:
-        logger.info(f"知识库已有 {stats['total_chunks']} 个 chunk，跳过初始化")
-        logger.info("如需重新初始化，请先调用 store.reset_collection()")
+        logger.info(f"Knowledge base already has {stats['total_chunks']} chunks, skipping init")
+        logger.info("To re-initialize, call store.reset_collection() first")
         return
 
     sample_docs = [
@@ -667,28 +596,18 @@ def seed_knowledge_base():
 
     store.index_documents(sample_docs)
 
-    # 重新加载 BM25 索引
+    # Reload BM25 index
     from retrieval_layer import RetrievalService
     RetrievalService().rebuild_bm25_index()
 
-    logger.info(f"示例知识库初始化完成: {store.get_collection_stats()}")
+    logger.info(f"Sample knowledge base initialized: {store.get_collection_stats()}")
 
 
-# ============================================================================
-# 3. 命令行交互模式
-# ============================================================================
+# >>> CLI interactive mode
 def interactive_mode():
     """
-    命令行交互模式 — 快速测试 RAG 效果
-
-    使用方式:
-        python main.py
-
-    支持的命令:
-        /help    — 显示帮助
-        /stats   — 显示知识库统计
-        /reset   — 重置当前会话
-        /exit    — 退出
+    CLI interactive mode for quick RAG testing.
+    Commands: /help, /stats, /reset, /exit.
     """
     print("\n" + "=" * 60)
     print("  DeepService — 企业级智能客服系统")
@@ -711,7 +630,7 @@ def interactive_mode():
         if not user_input:
             continue
 
-        # 处理命令
+        # Handle commands
         if user_input.startswith("/"):
             cmd = user_input[1:].lower()
             if cmd == "exit" or cmd == "quit":
@@ -740,14 +659,14 @@ def interactive_mode():
                 print(f"未知命令: {user_input}，输入 /help 查看帮助\n")
                 continue
 
-        # 处理转人工
+        # Handle human transfer request
         if user_input.strip() == "人工":
             print("\n🤖 DeepService: 正在为您转接人工客服...")
             print("   预计等待时间: 约 30 秒")
             print("   请稍候，人工坐席将接入此对话。\n")
             continue
 
-        # 处理正常查询
+        # Handle normal query
         print("\n🤖 DeepService: ", end="", flush=True)
 
         try:
@@ -757,11 +676,11 @@ def interactive_mode():
             )
             conversation_id = result["conversation_id"]
 
-            # 打印结果
+            # Print result
             print(result["content"])
-            print()  # 空行
+            print()
 
-            # 打印元信息
+            # Print metadata
             meta = result["metadata"]
             intent = meta.get("intent", "unknown")
             confidence = result["confidence"]
@@ -772,7 +691,7 @@ def interactive_mode():
                 info_parts.append(f"参考来源: {len(result['sources'])} 条")
             info_parts.append(f"耗时: {elapsed:.2f}s")
 
-            # 颜色标记
+            # Confidence indicator
             if confidence < 0.5:
                 confidence_mark = "⚠️"
             elif confidence < 0.7:
@@ -782,191 +701,26 @@ def interactive_mode():
 
             print(f"  {confidence_mark} {' | '.join(info_parts)}")
 
-            # 低置信度提示
+            # Low confidence warning
             if confidence < 0.5:
                 print("  💡 此回答置信度较低，建议确认后使用或联系人工客服。")
 
         except Exception as e:
-            logger.error(f"查询处理失败: {e}")
+            logger.error(f"Query processing failed: {e}")
             print(f"\n⚠️ 抱歉，处理您的问题时遇到错误。请稍后再试。\n")
 
 
-# ============================================================================
-# 4. API 服务入口（FastAPI）
-# ============================================================================
-def create_app():
-    """
-    创建 FastAPI 应用
-
-    使用方式:
-        python main.py --api
-        或
-        uvicorn main:app --reload
-    """
-    try:
-        from fastapi import FastAPI, HTTPException, Query
-        from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import StreamingResponse
-        from pydantic import BaseModel, Field
-    except ImportError:
-        logger.error("请安装 FastAPI 依赖: pip install fastapi uvicorn sse-starlette")
-        raise
-
-    app = FastAPI(
-        title="DeepService RAG API",
-        description="企业级智能客服系统 — 基于 DeepSeek + RAG",
-        version="1.0.0",
-    )
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # 全局编排器实例
-    orchestrator = RAGOrchestrator()
-
-    class ChatRequest(BaseModel):
-        message: str = Field(..., min_length=1, max_length=2000)
-        conversation_id: Optional[str] = None
-        stream: bool = Field(default=True, description="是否流式输出")
-
-    class ChatResponse(BaseModel):
-        conversation_id: str
-        content: str
-        response_type: str
-        confidence: float
-        metadata: dict = {}
-        elapsed_seconds: float = 0.0
-
-    @app.get("/")
-    async def root():
-        return {
-            "name": "DeepService RAG API",
-            "version": "1.0.0",
-            "docs": "/docs",
-        }
-
-    @app.get("/health")
-    async def health():
-        return {"status": "healthy", "model": orchestrator.config.llm.chat_model}
-
-    @app.post("/api/chat", response_model=ChatResponse)
-    async def chat(request: ChatRequest):
-        """
-        对话接口 — 非流式模式
-
-        返回完整的 RAG 回答，包含来源标注和置信度。
-        """
-        try:
-            result = orchestrator.process_query(
-                user_message=request.message,
-                conversation_id=request.conversation_id,
-                stream=False,
-            )
-            return ChatResponse(
-                conversation_id=result["conversation_id"],
-                content=result["content"],
-                response_type=result["response_type"],
-                confidence=result["confidence"],
-                metadata=result["metadata"],
-                elapsed_seconds=result["elapsed_seconds"],
-            )
-        except Exception as e:
-            logger.error(f"API 错误: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post("/api/chat/stream")
-    async def chat_stream(request: ChatRequest):
-        """
-        流式对话接口 — SSE 模式
-
-        返回 Server-Sent Events 流。
-        """
-        async def event_generator():
-            try:
-                for event in orchestrator.process_query_stream(
-                    user_message=request.message,
-                    conversation_id=request.conversation_id,
-                ):
-                    event_type = event.get("event", "message")
-                    data = event.get("data", "")
-                    yield f"event: {event_type}\ndata: {data}\n\n"
-            except Exception as e:
-                yield f"event: error\ndata: {{\"error\": \"{str(e)}\"}}\n\n"
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    @app.get("/api/conversations/{conversation_id}")
-    async def get_conversation(conversation_id: str):
-        """获取会话历史"""
-        history = orchestrator._conversation_store.get(conversation_id, [])
-        return {"conversation_id": conversation_id, "messages": history}
-
-    @app.get("/api/admin/stats")
-    async def get_stats():
-        """获取知识库和系统统计"""
-        store = VectorStoreManager()
-        kb_stats = store.get_collection_stats()
-        return {
-            "knowledge_base": kb_stats,
-            "active_conversations": len(orchestrator._conversation_store),
-            "model": orchestrator.config.llm.chat_model,
-        }
-
-    @app.post("/api/knowledge/search")
-    async def search_knowledge(
-        query: str = Query(..., min_length=1),
-        top_k: int = Query(default=5, ge=1, le=20),
-    ):
-        """知识库检索接口"""
-        search_result = orchestrator.retrieval_service.search(
-            query=query, top_k=top_k, strategy="rrf"
-        )
-        return {
-            "query": query,
-            "results": [
-                {
-                    "content": r.content,
-                    "score": r.final_score,
-                    "metadata": r.metadata,
-                }
-                for r in search_result.results
-            ],
-            "top_similarity": search_result.top_similarity,
-            "result_count": search_result.result_count,
-        }
-
-    return app
-
-
-# ============================================================================
-# 5. 程序入口
-# ============================================================================
+# >>> CLI entry point
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="DeepService RAG — 企业级智能客服系统")
-    parser.add_argument("--api", action="store_true", help="启动 FastAPI 服务")
-    parser.add_argument("--host", default="0.0.0.0", help="API 服务主机")
-    parser.add_argument("--port", type=int, default=8000, help="API 服务端口")
-    parser.add_argument("--seed", action="store_true", help="初始化示例知识库")
-    parser.add_argument("--scenario", default="general", help="场景: general|sales|it")
+    parser = argparse.ArgumentParser(description="DeepService RAG — CLI & Seed Utility")
+    parser.add_argument("--seed", action="store_true", help="Initialize sample knowledge base")
+    parser.add_argument("--scenario", default="general", help="Scenario: general|sales|it")
 
     args = parser.parse_args()
 
-    # 环境变量检查
+    # Check environment variables
     import os as _os
     if not _os.getenv("DEEPSEEK_API_KEY"):
         print("=" * 60)
@@ -978,24 +732,12 @@ if __name__ == "__main__":
         print()
         print("继续以演示模式运行（部分功能需要 API Key）...\n")
 
-    # 初始化知识库
+    # Initialize knowledge base
     if args.seed:
-        logger.info("初始化示例知识库...")
+        logger.info("Initializing sample knowledge base...")
         seed_knowledge_base()
 
-    # 启动模式选择
-    if args.api:
-        logger.info(f"启动 FastAPI 服务: http://{args.host}:{args.port}")
-        logger.info(f"API 文档: http://{args.host}:{args.port}/docs")
-        try:
-            import uvicorn
-            app = create_app()
-            uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-        except ImportError:
-            logger.error("FastAPI 未安装。请运行: pip install fastapi uvicorn sse-starlette")
-            sys.exit(1)
-    else:
-        # 默认：命令行交互模式
-        if args.seed:
-            print("\n✅ 示例知识库已初始化。现在可以提问了！\n")
-        interactive_mode()
+    # CLI interactive mode (for API server: uvicorn api_server:app)
+    if args.seed:
+        print("\n✅ 示例知识库已初始化。现在可以提问了！\n")
+    interactive_mode()

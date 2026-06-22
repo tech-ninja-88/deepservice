@@ -1,32 +1,14 @@
 """
-=============================================================================
-DeepService 对话管理 — 上下文管理模块 (Context Manager)
-=============================================================================
+DeepService 对话管理 — 上下文管理 (Context Manager)
+
 职责：
   1. 短期记忆 — 滑动窗口保留最近 N 轮完整对话
   2. 长期记忆 — 对话摘要 + 用户画像（偏好、历史标签）
   3. 跨轮次上下文融合 — 将多轮上下文注入 LLM Prompt
   4. 实体追踪 — 跨轮次追踪用户提及的关键实体
 
-企业级设计原则：
-  - 滑动窗口 + 摘要压缩：控制 Token 成本同时保留关键信息
-  - 用户画像渐进式构建：每个对话轮次更新画像维度
-  - 上下文裁剪策略：长对话自动压缩早期轮次
-  - 实体跨轮次继承：用户说的订单号在后续对话自动追溯
-
-记忆架构：
-  ┌─────────────────────────────────────────────────┐
-  │         短期记忆（滑动窗口，N=10轮）              │
-  │  [轮1] [轮2] ... [轮N-1] [轮N] ← 完整保留       │
-  └─────────────────┬───────────────────────────────┘
-                    │ 超出窗口的轮次 →
-  ┌─────────────────▼───────────────────────────────┐
-  │         长期记忆（摘要压缩 + 用户画像）           │
-  │  - 对话摘要（200字以内）                          │
-  │  - 关键实体：{orderId, product, intent...}       │
-  │  - 用户画像：{偏好, 历史问题类型, 情感倾向}        │
-  └─────────────────────────────────────────────────┘
-=============================================================================
+Memory model: sliding window (N=10) for recent turns + compressed summaries for older turns.
+User profiles are built incrementally across turns. Entities carry across rounds automatically.
 """
 
 import time
@@ -340,10 +322,11 @@ class ContextManager:
           - 无缓存时调用 LLM 生成
           - 摘要长度控制在 200 字以内
         """
-        # 检查缓存（使用消息哈希判断是否需要重新生成）
-        cache_key = self._compute_turns_hash(early_turns)
-        # TODO: 实际项目中检查 Redis 缓存的摘要
-        # 这里直接生成
+        # TODO(redis): 使用 turns_hash 做 Redis 缓存键，避免重复调用 LLM 生成摘要。
+        # 当前为简化实现每次都重新生成；生产环境应：
+        #   1. 计算 turns_hash
+        #   2. 查 Redis cache_key → 命中返回缓存
+        #   3. 未命中 → 调用 LLM → 写入 Redis（TTL=会话超时）
 
         return self._generate_summary(early_turns)
 
@@ -370,17 +353,15 @@ class ContextManager:
             for user_msg, asst_msg in turns
         )
 
-        # 调用 DeepSeek 生成摘要
+        # Use DeepSeek to generate summary
         try:
-            from openai import OpenAI
-            from config import get_api_key
-            api_key = get_api_key()
-            if not api_key:
-                raise ValueError("DEEPSEEK_API_KEY 未设置")
-            client = OpenAI(
-                api_key=api_key,
-                base_url=self.config.llm.base_url,
-            )
+            from config import get_llm_client
+            client = get_llm_client()
+            if client is None:
+                return "\n".join(
+                    f"User asked: {user_msg.content[:50]}..."
+                    for user_msg, _ in turns[-3:]
+                )
 
             prompt = f"""请用2-3句话总结以下客服对话的关键信息。包括：
 1. 用户的主要问题或需求
@@ -472,81 +453,26 @@ class ContextManager:
         }
 
     def _extract_entities(self, text: str) -> List[Entity]:
-        """
-        实体抽取（基于正则规则 + 可扩展 LLM）
+        """Extract entities from text using shared regex patterns."""
+        from entity_extractor import extract_entities
 
-        生产环境建议使用专用 NER 模型或 LLM 实体抽取。
-        """
-        import re
+        type_map = {
+            "order_id": EntityType.ORDER_ID,
+            "phone_number": EntityType.PHONE_NUMBER,
+            "tracking_number": EntityType.TRACKING_NUMBER,
+            "date": EntityType.DATE,
+            "amount": EntityType.AMOUNT,
+            "email": EntityType.EMAIL,
+        }
+
         entities = []
-
-        # 订单号（示例模式：字母+数字组合）
-        order_patterns = [
-            r"(?:订单|#|No\.)(\d{6,20})",
-            r"(?:order[_\-\s]?)(\d{6,20})",
-            r"[A-Z]{2,4}\d{6,12}",
-        ]
-        for pattern in order_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
+        for ext in extract_entities(text):
+            etype = type_map.get(ext.entity_type)
+            if etype:
                 entities.append(Entity(
-                    type=EntityType.ORDER_ID, value=match.group(0),
-                    confidence=0.9,
+                    type=etype, value=ext.value,
+                    confidence=ext.confidence,
                 ))
-
-        # 手机号
-        phone_patterns = [
-            r"1[3-9]\d{9}",
-            r"\d{3,4}-\d{7,8}",
-        ]
-        for pattern in phone_patterns:
-            for match in re.finditer(pattern, text):
-                entities.append(Entity(
-                    type=EntityType.PHONE_NUMBER, value=match.group(0),
-                    confidence=0.95,
-                ))
-
-        # 金额
-        amount_pattern = r"\d+\.?\d*\s*(?:元|块|美元|USD|CNY)"
-        for match in re.finditer(amount_pattern, text, re.IGNORECASE):
-            entities.append(Entity(
-                type=EntityType.AMOUNT, value=match.group(0),
-                confidence=0.85,
-            ))
-
-        # 物流单号
-        tracking_patterns = [
-            r"(?:快递|物流|运单).{0,5}(\d{8,20})",
-            r"[A-Z]{2}\d{8,12}",
-            r"SF\d{10,15}",
-        ]
-        for pattern in tracking_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                entities.append(Entity(
-                    type=EntityType.TRACKING_NUMBER, value=match.group(0),
-                    confidence=0.85,
-                ))
-
-        # 日期
-        date_patterns = [
-            r"\d{4}[-/]\d{1,2}[-/]\d{1,2}",
-            r"\d{1,2}月\d{1,2}[日号]",
-            r"(?:今天|明天|昨天|前天|大前天)",
-        ]
-        for pattern in date_patterns:
-            for match in re.finditer(pattern, text):
-                entities.append(Entity(
-                    type=EntityType.DATE, value=match.group(0),
-                    confidence=0.9,
-                ))
-
-        # 邮箱
-        email_pattern = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
-        for match in re.finditer(email_pattern, text):
-            entities.append(Entity(
-                type=EntityType.EMAIL, value=match.group(0),
-                confidence=0.98,
-            ))
-
         return entities
 
     def _compute_turns_hash(self, turns: List[Tuple[Message, Optional[Message]]]) -> str:
@@ -625,10 +551,19 @@ class ContextManager:
 
         return sorted(relevant, key=lambda e: e.last_mentioned_turn, reverse=True)
 
+    def cleanup_stale_profiles(self, max_age_seconds: int = 604800):
+        """Remove user profiles not updated in the last max_age_seconds (default 7 days)."""
+        import time
+        now = time.time()
+        stale = [uid for uid, p in self._profiles.items()
+                 if now - p.updated_at > max_age_seconds]
+        for uid in stale:
+            del self._profiles[uid]
+        if stale:
+            logger.info(f"[ContextManager] Cleaned {len(stale)} stale profiles")
 
-# ============================================================================
-# 全局单例
-# ============================================================================
+
+# Thread-safe lazy init — ContextManager caches user profiles
 import threading
 
 _context_manager: Optional[ContextManager] = None

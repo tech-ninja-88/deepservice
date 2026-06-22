@@ -1,6 +1,6 @@
 # DeepService 线上部署指南
 
-> 完整部署文档，将企业级智能客服系统部署到线上，面试时直接展示。
+> 将 DeepService 企业级智能客服系统部署到线上环境。
 
 ---
 
@@ -239,7 +239,7 @@ docker compose up -d --build
 # /etc/nginx/sites-available/deepservice
 ```
 
-**推荐云服务器**（国内面试官访问快）：
+**推荐云服务器**：
 - **阿里云 ECS**：2核4G 约 ¥68/月
 - **腾讯云轻量**：2核2G 约 ¥58/月
 - **AWS Lightsail**：$5/月（新加坡区域）
@@ -252,7 +252,7 @@ docker compose up -d --build
 
 **问题**：流式对话超过 60 秒被 Vercel 截断
 
-**原因**：Vercel Serverless Functions 最大执行时间为 60 秒（Hobby 计划）[reference:7]
+**原因**：Vercel Serverless Functions 最大执行时间为 60 秒（Hobby 计划）
 
 **解决方案**：
 
@@ -328,32 +328,22 @@ curl https://api.deepseek.com/v1/chat/completions \
 
 | 环境 | URL | 说明 |
 |------|-----|------|
-| **前端** | `https://deepservice.vercel.app` | 面试官打开的聊天界面 |
+| **前端** | `https://deepservice.vercel.app` | 用户聊天界面 |
 | **后端 API** | `https://deepservice-api.onrender.com` | REST + SSE 接口 |
 | **API 文档** | `https://deepservice-api.onrender.com/docs` | Swagger 自动生成 |
 | **管理后台** | `https://deepservice.vercel.app/admin` | 对话日志/知识库管理 |
 
 ---
 
-## 📱 面试展示清单
+## 部署验证清单
 
-面试前确认以下功能正常：
+部署后确认以下功能正常：
 
 - [ ] 打开前端 URL，能看到聊天界面
 - [ ] 输入"你好"，机器人能正常回复
 - [ ] 问一个知识库内的问题（如"如何退货"），能看到来源标注
 - [ ] 问一个知识库外的问题（如"今天天气"），机器人回复"不确定"
-- [ ] 连续多轮对话正常（先问"退货"，再问"运费谁承担"）
+- [ ] 连续多轮对话正常
 - [ ] 点击"新对话"能开启新会话
-- [ ] 管理后台 `https://xxx.vercel.app/admin` 能正常访问
-- [ ] 移动端打开界面适配正常
-
----
-
-## 💡 面试演示话术
-
-> "这是我独立设计开发的企业级智能客服系统 DeepService。
-> 它基于 DeepSeek 大模型，核心亮点是四层幻觉防护体系：
-> 输入安全过滤 → 知识边界控制 → RAG 检索增强 → 输出验证。
-> 前端使用 Next.js 部署在 Vercel，后端 FastAPI 部署在 Render，全免费。
-> 我演示几个场景：首先问一个知识库内的问题..."
+- [ ] 管理后台能正常访问
+- [ ] 移动端界面适配正常

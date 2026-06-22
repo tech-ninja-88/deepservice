@@ -1,61 +1,6 @@
 """
-=============================================================================
-DeepService 对话管理 — 对话编排器 (Dialogue Orchestrator)
-=============================================================================
-职责：
-  1. 整合六大对话管理模块为统一的对话引擎
-  2. 提供完整的多轮对话处理流水线
-  3. 多意图任务的编排执行
-
-整合的模块：
-  session_manager.py     → 会话生命周期管理
-  context_manager.py     → 多轮上下文记忆
-  intent_recognizer.py   → 意图识别 + 实体抽取
-  dialogue_state.py      → FSM 状态机 + 槽位填充
-  router.py              → 意图路由分发
-  human_transfer.py      → 人工转接
-
-完整处理流水线：
-  用户消息
-    │
-    ▼
-  [SessionManager] 获取/创建会话
-    │
-    ▼
-  [TransferDetector] 是否需要转人工？
-    │
-    ├── 是 → [HumanTransferService] 打包上下文 → 分配坐席
-    │
-    └── 否
-        │
-        ▼
-  [IntentRecognizer] 意图识别 + 实体抽取
-        │
-        ▼
-  [ContextManager] 构建对话记忆（短期+长期+画像）
-        │
-        ▼
-  [DialogueStateTracker] 当前是否在结构化流程中？
-        │
-        ├── 是 → 继续槽位填充
-        │
-        └── 否
-            │
-            ▼
-  [IntentRouter] 意图 → 处理策略路由
-        │
-        ├── RAG_RETRIEVAL → [RetrievalService + RAGGenerator]
-        ├── STRUCTURED_FLOW → [DialogueStateTracker.start_flow]
-        ├── TRANSFER_HUMAN → [HumanTransferService]
-        ├── RULE_RESPONSE → 直接返回模板
-        └── CLARIFY → 追问澄清
-            │
-            ▼
-  [HallucinationDefense] 输出验证 + 置信度评分
-            │
-            ▼
-  [SessionManager] 保存消息 → 返回响应
-=============================================================================
+Dialogue Orchestrator — integrates all dialogue modules into a single processing pipeline.
+Pipeline: Session -> TransferDetect -> Intent -> Context -> StateTracker -> Router -> Defense -> Response.
 """
 
 import json
@@ -69,7 +14,7 @@ from loguru import logger
 
 from config import get_config
 
-# 导入所有对话管理模块
+# Import all dialogue management modules
 from session_manager import (
     SessionManager, Session, SessionStatus, Message, MessageRole,
     get_session_manager,
@@ -96,40 +41,36 @@ from human_transfer import (
 )
 
 
-# ============================================================================
-# 统一响应格式
-# ============================================================================
+# ### Standard response format
 @dataclass
 class DialogueResponse:
     """
-    标准化的对话响应
-
-    无论走哪种处理路径，最终都返回此格式。
+    Standardized response format — all processing paths return this.
     """
-    # 核心字段
+    # Core fields
     conversation_id: str
     content: str
     response_type: str                      # knowledge_based / uncertain / greeting / transfer / flow_step
     confidence: float = 1.0
 
-    # 意图信息
+    # Intent info
     intent: str = ""
     is_multi_intent: bool = False
     intents_detail: List[Dict] = field(default_factory=list)
 
-    # 路由信息
+    # Route info
     route_action: str = ""
 
-    # 结构化流程信息
-    flow_step: Optional[Dict] = None        # 流程中的步骤信息
+    # Structured flow info
+    flow_step: Optional[Dict] = None
 
-    # 转接信息
+    # Transfer info
     transfer_info: Optional[Dict] = None
 
-    # 来源引用
+    # Sources
     sources: List[Dict] = field(default_factory=list)
 
-    # 元数据
+    # Metadata
     entities: List[Dict] = field(default_factory=list)
     tracked_entities: Dict[str, str] = field(default_factory=dict)
     memory_context_used: bool = False
@@ -173,23 +114,17 @@ class DialogueResponse:
         return result
 
 
-# ============================================================================
-# 核心编排器
-# ============================================================================
+# ### Core orchestrator
 class DialogueOrchestrator:
     """
-    对话编排器 — 完整的对话处理引擎
-
-    使用示例：
-        orchestrator = DialogueOrchestrator()
-        response = orchestrator.process("你好，我想退货", conversation_id="...")
-        print(response.content)
+    Full dialogue processing engine.
+    Usage: orchestrator.process("你好，我想退货", conversation_id="...")
     """
 
     def __init__(self):
         self.config = get_config()
 
-        # 初始化所有子系统
+        # Initialize all subsystems
         self.session_mgr = get_session_manager()
         self.context_mgr = get_context_manager()
         self.intent_recognizer = get_intent_recognizer()
@@ -197,12 +132,12 @@ class DialogueOrchestrator:
         self.router = get_router()
         self.transfer_service = get_human_transfer_service()
 
-        # 可选的 RAG 依赖（延迟导入避免循环依赖）
+        # Optional RAG dependencies (lazy import to avoid circular deps)
         self._retrieval_service = None
         self._rag_generator = None
         self._defense_system = None
 
-        logger.info("[DialogueOrchestrator] 编排器初始化完成")
+        logger.info("[DialogueOrchestrator] Orchestrator initialized")
 
     @property
     def retrieval_service(self):
@@ -235,18 +170,13 @@ class DialogueOrchestrator:
         **kwargs,
     ) -> DialogueResponse:
         """
-        ┌─────────────────────────────────────────────────┐
-        │        处理单条用户消息（完整流水线）              │
-        │                                                 │
-        │  这是整个对话系统的核心入口方法。                  │
-        │  面试时可以逐步骤讲解这个方法的处理流程。           │
-        └─────────────────────────────────────────────────┘
+        Process a single user message through the full pipeline. Core entry point.
         """
         start_time = time.time()
-        logger.info(f"[Orchestrator] ====== 开始处理消息 ======")
-        logger.info(f"[Orchestrator] 用户输入: '{user_message[:80]}...'")
+        logger.info(f"[Orchestrator] ====== Processing message ======")
+        logger.info(f"[Orchestrator] Input: '{user_message[:80]}...'")
 
-        # ──── Step 1: 会话管理 ────
+        # Step 1: Session management
         session, is_new = self.session_mgr.get_or_create_session(
             session_id=conversation_id,
             user_id=user_id,
@@ -255,19 +185,19 @@ class DialogueOrchestrator:
         )
         conversation_id = session.id
         logger.info(
-            f"[Step 1] 会话: {conversation_id[:12]}... "
-            f"(新会话={is_new}, 第{session.turn_count}轮)"
+            f"[Step 1] Session: {conversation_id[:12]}... "
+            f"(new={is_new}, turn={session.turn_count})"
         )
 
-        # 保存用户消息
+        # Save user message
         user_msg = Message(role=MessageRole.USER, content=user_message)
         self.session_mgr.append_message(conversation_id, user_msg)
 
-        # ──── Step 2: 转人工检测 ────
+        # Step 2: Human transfer detection
         intent = ""
         confidence = 1.0
 
-        # 先做快速意图识别用于转接检测
+        # Quick intent recognition for transfer check
         quick_result = self.intent_recognizer.recognize(
             user_message, session_id=conversation_id
         )
@@ -283,66 +213,66 @@ class DialogueOrchestrator:
         )
 
         if transfer_trigger:
-            logger.info(f"[Step 2] 触发转人工: {transfer_trigger.value}")
+            logger.info(f"[Step 2] Transfer triggered: {transfer_trigger.value}")
             return self._handle_transfer(
                 conversation_id, user_id, transfer_trigger,
                 quick_result, start_time,
             )
 
-        # ──── Step 3: 意图识别（完整版）────
-        logger.info("[Step 3] 意图识别...")
-        recognition = quick_result  # 复用快速识别结果
+        # Step 3: Intent recognition (full)
+        logger.info("[Step 3] Intent recognition...")
+        recognition = quick_result  # reuse quick result
         primary_intent = recognition.primary_intent
         top_intent_name = primary_intent.intent.value if primary_intent else "unknown"
 
         logger.info(
-            f"[Step 3] 意图: {top_intent_name} "
-            f"(置信度: {primary_intent.confidence if primary_intent else 0:.2f})"
+            f"[Step 3] Intent: {top_intent_name} "
+            f"(confidence: {primary_intent.confidence if primary_intent else 0:.2f})"
         )
         if recognition.is_multi_intent:
             logger.info(
-                f"[Step 3] 多意图: {[i.intent.value for i in recognition.intents]}"
+                f"[Step 3] Multi-intent: {[i.intent.value for i in recognition.intents]}"
             )
 
-        # ──── Step 4: 构建对话记忆 ────
-        logger.info("[Step 4] 构建对话记忆...")
+        # Step 4: Build conversation memory
+        logger.info("[Step 4] Building memory...")
         memory = self.context_mgr.build_memory(conversation_id, self.session_mgr)
 
-        # 检查是否有跨轮次实体可用于补充当前查询
+        # Check for cross-turn entities relevant to current query
         relevant_entities = self.context_mgr.get_relevant_entities_for_query(
             memory, user_message
         )
 
         if relevant_entities:
             logger.info(
-                f"[Step 4] 跨轮次实体: "
+                f"[Step 4] Cross-turn entities: "
                 f"{[(e.type.value, e.value) for e in relevant_entities]}"
             )
 
-        # ──── Step 5: 检查是否在结构化流程中 ────
+        # Step 5: Check if in structured flow
         state = self.state_tracker.fsm.get_current_state(conversation_id)
-        logger.info(f"[Step 5] 当前对话状态: {state.value}")
+        logger.info(f"[Step 5] Current state: {state.value}")
 
         if self.state_tracker.fsm.is_in_structured_flow(conversation_id):
-            # 在流程中，继续处理槽位
+            # In flow — continue filling slots
             return self._handle_flow_step(
                 conversation_id, user_message, recognition, memory, start_time
             )
 
-        # ──── Step 6: 路由决策 ────
-        logger.info("[Step 6] 路由决策...")
+        # Step 6: Route decision
+        logger.info("[Step 6] Route decision...")
         route_decisions = self.router.route(recognition, conversation_id)
 
         if not route_decisions:
             return self._build_fallback_response(
-                conversation_id, "无法确定如何处理您的请求。", recognition, start_time
+                conversation_id, "Unable to determine how to handle your request.", recognition, start_time
             )
 
         primary_decision = route_decisions[0]
-        logger.info(f"[Step 6] 路由: {primary_decision.action.value}")
+        logger.info(f"[Step 6] Route: {primary_decision.action.value}")
 
-        # ──── Step 7: 按路由执行 ────
-        logger.info("[Step 7] 执行处理...")
+        # Step 7: Execute route
+        logger.info("[Step 7] Executing handler...")
         response = self._execute_route(
             primary_decision,
             user_message=user_message,
@@ -352,7 +282,7 @@ class DialogueOrchestrator:
             start_time=start_time,
         )
 
-        # ──── Step 8: 保存助手消息 ────
+        # Step 8: Save assistant message
         asst_msg = Message(
             role=MessageRole.ASSISTANT,
             content=response.content,
@@ -364,16 +294,16 @@ class DialogueOrchestrator:
         )
         self.session_mgr.append_message(conversation_id, asst_msg)
 
-        # ──── Step 9: 更新用户画像 ────
+        # Step 9: Update user profile
         self.context_mgr.update_profile_from_turn(
             user_id=user_id,
             intent=top_intent_name,
-            sentiment=0.5,  # TODO: 接入情感分析
+            sentiment=0.5,  # sentiment analysis not yet wired
             session_id=conversation_id,
         )
 
         elapsed = (time.time() - start_time) * 1000
-        logger.info(f"[Orchestrator] ====== 处理完成 ({elapsed:.0f}ms) ======")
+        logger.info(f"[Orchestrator] ====== Processing complete ({elapsed:.0f}ms) ======")
 
         return response
 
@@ -382,38 +312,33 @@ class DialogueOrchestrator:
         user_message: str,
         conversation_id: Optional[str] = None,
         user_id: str = "anonymous",
-    ) -> Generator[str, None, DialogueResponse]:
-        """
-        流式处理（SSE 模式）
+    ) -> Generator[str, None, None]:
+        """Streaming response for SSE transport.
 
-        用于实时打字机效果输出。
+        Processes the full message synchronously then yields in chunks
+        for progressive UI updates. True token-level streaming requires
+        deeper integration with RAGGenerator.generate_stream().
         """
-        # 简化版：先做完整处理，再逐字输出
-        # 生产环境应在 RAGGenerator.generate_stream() 层级实现真正的流式
         full_response = self.process(user_message, conversation_id, user_id)
 
-        # 逐块 yield 内容（模拟流式）
         content = full_response.content
-        chunk_size = 10  # 每次输出 10 个字符
+        chunk_size = 10
 
         for i in range(0, len(content), chunk_size):
             chunk = content[i:i + chunk_size]
             yield json.dumps({"type": "token", "content": chunk}, ensure_ascii=False)
 
-        # 最后输出元数据
         yield json.dumps({"type": "metadata", "data": full_response.to_dict()}, ensure_ascii=False)
         yield json.dumps({"type": "done"}, ensure_ascii=False)
 
-        return full_response
-
-    # ──── 路由处理分支 ────
+    # ### Route handler branches
 
     def _execute_route(
         self,
         decision: RouteDecision,
         **context,
     ) -> DialogueResponse:
-        """根据路由决策执行对应的处理"""
+        """Execute the handler matching the route decision"""
         action = decision.action
         conversation_id = context.get("conversation_id", "")
         user_message = context.get("user_message", "")
@@ -463,18 +388,16 @@ class DialogueOrchestrator:
         start_time: float,
     ) -> DialogueResponse:
         """
-        RAG 检索生成处理
-
-        集成 hallucination_guard 进行知识边界控制和输出验证。
+        RAG retrieval + generation with hallucination guard boundary check and output validation.
         """
-        # 1. 检索
+        # 1. Retrieve
         search_result = self.retrieval_service.search(
             query=user_message,
             strategy="rrf",
             enable_rerank=True,
         )
 
-        # 2. 知识边界预检
+        # 2. Knowledge boundary pre-check
         pre_check = self.defense_system.pre_generation_check(user_message, search_result)
         if pre_check.decision.value in ("block", "fallback"):
             content = self.defense_system.get_fallback_response(pre_check, user_message)
@@ -489,7 +412,7 @@ class DialogueOrchestrator:
                 metadata={"fallback_reason": pre_check.reason},
             )
 
-        # 3. 生成（注入上下文记忆）
+        # 3. Generate (inject context memory)
         memory_context = memory.to_prompt_context()
 
         rag_response = self.rag_generator.generate(
@@ -504,7 +427,7 @@ class DialogueOrchestrator:
             ),
         )
 
-        # 4. 输出验证
+        # 4. Output validation
         validation = self.defense_system.post_generation_validate(
             rag_response.content, search_result
         )
@@ -512,7 +435,7 @@ class DialogueOrchestrator:
             search_result, rag_response.content, validation
         )
 
-        # 5. 如果幻觉风险高，切换为兜底回复
+        # 5. If hallucination risk is high, switch to fallback
         if validation.hallucination_risk > 0.5:
             logger.warning(f"[Orchestrator] 幻觉风险过高: {validation.hallucination_risk:.3f}")
             content = self.defense_system.get_fallback_response(
@@ -545,8 +468,8 @@ class DialogueOrchestrator:
         )
 
     def _handle_rag_order(self, *args, **kwargs) -> DialogueResponse:
-        """RAG + 订单查询（预留数据库查询接口）"""
-        # TODO: 集成订单数据库查询
+        """RAG + order lookup (reserved for DB integration)"""
+        # Order database integration point
         return self._handle_rag(*args, **kwargs)
 
     def _handle_start_flow(
@@ -558,7 +481,7 @@ class DialogueOrchestrator:
         start_time: float,
     ) -> DialogueResponse:
         """
-        启动结构化流程
+        Start a structured flow.
         """
         flow_type = decision.metadata.get("flow_type", FlowType.RETURN_EXCHANGE)
         result = self.state_tracker.start_flow(conversation_id, flow_type)
@@ -587,7 +510,7 @@ class DialogueOrchestrator:
         start_time: float,
     ) -> DialogueResponse:
         """
-        处理结构化流程中的用户输入
+        Handle user input during a structured flow.
         """
         result = self.state_tracker.process_user_input(conversation_id, user_message)
 
@@ -595,7 +518,7 @@ class DialogueOrchestrator:
         if result["status"] == "flow_completed":
             response_type = "flow_completed"
         elif result["status"] == "flow_cancelled":
-            response_type = "knowledge_based"  # 回到自由对话模式
+            response_type = "knowledge_based"  # back to free chat
         elif result.get("transfer_human"):
             return self._handle_transfer(
                 conversation_id, "anonymous",
@@ -620,7 +543,7 @@ class DialogueOrchestrator:
         recognition: RecognitionResult,
         start_time: float,
     ) -> DialogueResponse:
-        """追问澄清"""
+        """Ask for clarification"""
         return DialogueResponse(
             conversation_id=conversation_id,
             content="抱歉，我没有完全理解您的问题。能否请您再详细描述一下？",
@@ -638,7 +561,7 @@ class DialogueOrchestrator:
         recognition: RecognitionResult,
         start_time: float,
     ) -> DialogueResponse:
-        """规则直接回复"""
+        """Direct rule-based reply"""
         from router import IntentRouter
         content = IntentRouter.RULE_RESPONSES.get(
             decision.intent,
@@ -661,17 +584,17 @@ class DialogueOrchestrator:
         memory: ConversationMemory,
         start_time: float,
     ) -> DialogueResponse:
-        """直接 LLM 对话（不经过 RAG）"""
+        """Direct LLM response (no RAG retrieval)"""
         try:
-            from openai import OpenAI
-            from config import get_api_key
-            api_key = get_api_key()
-            if not api_key:
-                raise ValueError("DEEPSEEK_API_KEY 未设置")
-            client = OpenAI(
-                api_key=api_key,
-                base_url=self.config.llm.base_url,
-            )
+            from config import get_llm_client
+            client = get_llm_client()
+            if client is None:
+                return self._build_fallback_response(
+                    conversation_id,
+                    "抱歉，LLM 服务未配置，请联系管理员设置 DEEPSEEK_API_KEY。",
+                    None, start_time,
+                    error="llm_unavailable",
+                )
             memory_context = memory.to_prompt_context()
             response = client.chat.completions.create(
                 model=self.config.llm.chat_model,
@@ -711,9 +634,9 @@ class DialogueOrchestrator:
         start_time: float,
     ) -> DialogueResponse:
         """
-        执行人工转接
+        Execute human transfer.
         """
-        # 构建上下文
+        # Build context
         memory = self.context_mgr.build_memory(conversation_id, self.session_mgr)
         summary = memory.summary or ""
         recent_messages = [
@@ -726,7 +649,7 @@ class DialogueOrchestrator:
         ]
         entities = {k: v.value for k, v in memory.tracked_entities.items()}
 
-        # 发起转接
+        # Initiate transfer
         transfer = self.transfer_service.initiate_transfer(
             session_id=conversation_id,
             trigger=trigger,
@@ -736,7 +659,7 @@ class DialogueOrchestrator:
             tracked_entities=entities,
         )
 
-        # 构建用户响应
+        # Build user response
         if transfer.status == TransferStatus.QUEUED:
             queue_pos = self.transfer_service.agent_manager.get_queue_length()
             content = (
@@ -777,7 +700,7 @@ class DialogueOrchestrator:
         start_time: float,
         error: str = "",
     ) -> DialogueResponse:
-        """构建兜底响应"""
+        """Build a fallback response"""
         return DialogueResponse(
             conversation_id=conversation_id,
             content=content,
@@ -790,226 +713,25 @@ class DialogueOrchestrator:
         )
 
 
-# ============================================================================
-# 多轮对话演示
-# ============================================================================
-class MultiTurnDemo:
-    """
-    多轮对话演示 — 用于面试展示
-
-    演示场景：
-      1. 基础问答（带实体追踪）
-      2. 多意图处理
-      3. 退换货流程（FSM + 槽位填充）
-      4. 转人工流程
-    """
-
-    def __init__(self):
-        self.orchestrator = DialogueOrchestrator()
-
-    def run_demo_1_basic_qa_with_context(self):
-        """
-        演示1：基础问答 + 跨轮次上下文
-
-        展示：
-          - 实体跨轮次追踪
-          - 对话记忆维持
-          - RAG 检索生成
-        """
-        print("\n" + "=" * 60)
-        print("  演示1: 基础问答 + 跨轮次上下文追踪")
-        print("=" * 60)
-
-        conversation_id = None
-        messages = [
-            "我的订单#20240001发货了吗？",        # 第1轮
-            "那它大概什么时候能到？",              # 第2轮 — "它"指代订单#20240001
-            "好的，那如果到了我不满意能退货吗？",   # 第3轮 — 继承订单上下文
-        ]
-
-        for i, msg in enumerate(messages):
-            print(f"\n{'─' * 40}")
-            print(f"👤 用户(第{i+1}轮): {msg}")
-            response = self.orchestrator.process(msg, conversation_id=conversation_id)
-            conversation_id = response.conversation_id
-
-            print(f"🤖 客服: {response.content[:150]}...")
-            print(f"   [置信度: {response.confidence:.2f}, 意图: {response.intent}]")
-            if response.tracked_entities:
-                print(f"   [跟踪实体: {response.tracked_entities}]")
-
-    def run_demo_2_multi_intent(self):
-        """
-        演示2：多意图处理
-
-        展示：
-          - 一条消息包含多个意图的识别
-          - 多意图信息的逐个处理
-        """
-        print("\n" + "=" * 60)
-        print("  演示2: 多意图识别与处理")
-        print("=" * 60)
-
-        multi_intent_messages = [
-            "我要退货，顺便问一下你们会员怎么升级？",
-            "密码忘了，而且物流查不到，退款什么时候到账？",
-        ]
-
-        for msg in multi_intent_messages:
-            print(f"\n{'─' * 40}")
-            print(f"👤 用户: {msg}")
-
-            # 直接使用意图识别器查看多意图
-            result = self.orchestrator.intent_recognizer.recognize(msg)
-            print(f"🔍 识别到 {len(result.intents)} 个意图:")
-            for intent in result.intents:
-                print(f"   • {intent.intent.value} (置信度: {intent.confidence:.2f})")
-            print(f"   多意图: {result.is_multi_intent}")
-            if result.processing_priority:
-                print(f"   处理优先级: {result.processing_priority}")
-
-    def run_demo_3_structured_flow(self):
-        """
-        演示3：退换货结构化流程
-
-        展示：
-          - FSM 状态转移
-          - 槽位逐步填充
-          - 流程取消处理
-        """
-        print("\n" + "=" * 60)
-        print("  演示3: 退换货结构化流程 (FSM + Slot Filling)")
-        print("=" * 60)
-
-        conversation_id = None
-
-        flow_messages = [
-            "我要退货",
-            "",           # 系统提示提供订单号
-            "#20240001",  # 用户提供订单号
-            "质量问题",    # 选择退货原因
-            "有照片，衣服明显色差",
-            "确认",       # 确认提交
-        ]
-
-        # 启动流程
-        msg = flow_messages[0]
-        print(f"\n👤 用户: {msg}")
-        response = self.orchestrator.process(msg)
-        conversation_id = response.conversation_id
-        print(f"🤖 客服: {response.content}")
-        if response.flow_step:
-            print(f"   [流程步骤: {response.flow_step.get('status')}]")
-
-        # 后续槽位填充
-        for i, msg in enumerate(flow_messages[2:5], 1):
-            print(f"\n👤 用户: {msg}")
-            response = self.orchestrator.process(msg, conversation_id=conversation_id)
-            print(f"🤖 客服: {response.content}")
-            if response.flow_step:
-                print(f"   [进度: {response.flow_step.get('status')}]")
-
-        # 确认提交
-        print(f"\n👤 用户: 确认")
-        response = self.orchestrator.process("确认", conversation_id=conversation_id)
-        print(f"🤖 客服: {response.content}")
-        if response.flow_step:
-            print(f"   [流程结果: {response.flow_step.get('status')}]")
-
-    def run_demo_4_transfer_flow(self):
-        """
-        演示4：转人工流程
-
-        展示：
-          - 转接触发
-          - 上下文打包透传
-          - 排队/分配状态
-        """
-        print("\n" + "=" * 60)
-        print("  演示4: 人工转接流程")
-        print("=" * 60)
-
-        conversation_id = None
-
-        # 先建立一些对话上下文
-        setup_messages = [
-            "我的订单#20240001收到的东西是坏的",
-            "我拍了照片，确实有明显损坏",
-        ]
-        for msg in setup_messages:
-            response = self.orchestrator.process(msg, conversation_id=conversation_id)
-            conversation_id = response.conversation_id
-
-        # 触发转人工
-        print(f"\n👤 用户: 帮我转人工吧，我不想和机器人说了")
-        response = self.orchestrator.process(
-            "帮我转人工吧，我不想和机器人说了",
-            conversation_id=conversation_id,
-        )
-        print(f"🤖 客服: {response.content}")
-        if response.transfer_info:
-            print(f"\n📋 转接详情:")
-            for k, v in response.transfer_info.items():
-                print(f"   {k}: {v}")
-
-
-# ============================================================================
-# 全局单例
-# ============================================================================
 _orchestrator: Optional[DialogueOrchestrator] = None
-_orch_lock = threading.Lock()
 
 
 def get_orchestrator() -> DialogueOrchestrator:
     global _orchestrator
     if _orchestrator is None:
-        with _orch_lock:
-            if _orchestrator is None:
-                _orchestrator = DialogueOrchestrator()
+        _orchestrator = DialogueOrchestrator()
     return _orchestrator
 
 
-# ============================================================================
-# 主入口 — 运行所有演示
-# ============================================================================
+# ### Quick smoke test
 if __name__ == "__main__":
     import sys
 
     logger.remove()
-    logger.add(
-        sys.stderr,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
-        level="INFO",
-    )
+    logger.add(sys.stderr, level="INFO")
 
-    demo = MultiTurnDemo()
-
-    print("\n" + "█" * 60)
-    print("  DeepService 对话管理 — 多轮对话完整演示")
-    print("  整合 Session / Context / Intent / FSM / Router / Transfer")
-    print("█" * 60)
-
-    # 运行演示（根据需要注释/取消注释）
-    try:
-        demo.run_demo_1_basic_qa_with_context()
-    except Exception as e:
-        logger.error(f"演示1失败: {e}")
-
-    try:
-        demo.run_demo_2_multi_intent()
-    except Exception as e:
-        logger.error(f"演示2失败: {e}")
-
-    try:
-        demo.run_demo_3_structured_flow()
-    except Exception as e:
-        logger.error(f"演示3失败: {e}")
-
-    try:
-        demo.run_demo_4_transfer_flow()
-    except Exception as e:
-        logger.error(f"演示4失败: {e}")
-
-    print("\n" + "█" * 60)
-    print("  演示完成 ✓")
-    print("█" * 60)
+    orch = DialogueOrchestrator()
+    resp = orch.process("你好，请问可以退货吗？")
+    print(f"Intent: {resp.intent} | Confidence: {resp.confidence:.2f}")
+    print(f"Response: {resp.content[:200]}")
+    print("Dialogue orchestrator self-check complete.")

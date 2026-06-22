@@ -1,22 +1,7 @@
 """
-=============================================================================
-DeepService RAG — 知识库构建模块 (Data Layer)
-=============================================================================
-职责：
-  1. 文档解析：支持 TXT / Markdown / PDF / Word 多格式
-  2. 语义切分：智能分块策略，保证语义完整性
-  3. 向量化：文本 → Embedding 向量
-  4. 向量存储：ChromaDB 持久化
-
-企业级设计原则：
-  - 高质量 Chunking 是消除幻觉的基石
-  - 每个 Chunk 保留元数据追溯来源
-  - 分段+Embedding 支持批量处理和单条增量
-
-参考：
-  [reference:0] — RAG是控制AI幻觉最稳妥的主流技术路径
-  [reference:1] — 企业级RAG需形成数据层、检索层、生成层三层体系
-=============================================================================
+Data Layer — document parsing, semantic chunking, embedding, and vector storage.
+Chunk quality directly impacts retrieval accuracy.
+Each chunk carries source metadata for traceability.
 """
 
 import hashlib
@@ -33,16 +18,14 @@ from loguru import logger
 from config import get_config, ChunkingConfig
 
 
-# ============================================================================
-# 数据结构定义
-# ============================================================================
+# --- Data structures
 @dataclass
 class Document:
-    """原始文档"""
+    """Original document (title, content, source path and type)."""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     title: str = ""
     content: str = ""
-    source_path: str = ""           # 原始文件路径
+    source_path: str = ""           # original file path
     source_type: str = ""           # txt / md / pdf / docx
     metadata: Dict = field(default_factory=dict)
     created_at: str = ""
@@ -50,20 +33,14 @@ class Document:
 
 @dataclass
 class Chunk:
-    """
-    知识块 — RAG 检索的原子单元
-
-    设计要点：
-      - 每个 chunk 独立可检索，同时保留上下文关联
-      - metadata 完整追溯原始文档和位置
-      - content_hash 用于增量更新（检测变更）
-    """
+    """Atomic retrieval unit. Each chunk is independently retrievable with source metadata
+    for traceability. content_hash enables incremental indexing (change detection)."""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     document_id: str = ""
-    content: str = ""                           # 分块文本
-    chunk_index: int = 0                        # 在文档中的序号
-    embedding: Optional[List[float]] = None     # 向量（待填充）
-    content_hash: str = ""                      # 内容哈希（增量索引用）
+    content: str = ""                           # chunk text
+    chunk_index: int = 0                        # position in document
+    embedding: Optional[List[float]] = None     # vector (to be filled)
+    content_hash: str = ""                      # content hash for incremental indexing
     metadata: Dict = field(default_factory=dict)  # {title, source_path, page, section, ...}
 
     def __post_init__(self):
@@ -71,7 +48,7 @@ class Chunk:
             self.content_hash = hashlib.md5(self.content.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> Dict:
-        """转换为 ChromaDB 存储格式"""
+        """Convert to ChromaDB storage format."""
         return {
             "id": self.id,
             "document_id": self.document_id,
@@ -82,25 +59,23 @@ class Chunk:
         }
 
 
-# ============================================================================
-# 文档解析器 (Strategy Pattern)
-# ============================================================================
+# --- Document parsers (Strategy Pattern)
 class BaseDocumentParser(ABC):
-    """文档解析器抽象基类"""
+    """Abstract base class for document parsers."""
 
     @abstractmethod
     def parse(self, file_path: Path) -> Document:
-        """解析文件为 Document 对象"""
+        """Parse a file into a Document object."""
         ...
 
     @staticmethod
     def supports(extension: str) -> bool:
-        """判断是否支持该文件扩展名"""
+        """Return True if this parser supports the given file extension."""
         ...
 
 
 class TextParser(BaseDocumentParser):
-    """纯文本解析器"""
+    """Plain text parser (.txt, .log, .csv, .json, .xml)."""
 
     @staticmethod
     def supports(extension: str) -> bool:
@@ -119,20 +94,14 @@ class TextParser(BaseDocumentParser):
         )
 
     def _clean_text(self, text: str) -> str:
-        """清洗文本：移除多余空行、统一换行符"""
+        """Remove empty lines, normalize line endings."""
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        # 保留有意义的内容行（移除纯空格行）
         lines = [line for line in text.split("\n") if line.strip()]
         return "\n".join(lines)
 
 
 class MarkdownParser(BaseDocumentParser):
-    """
-    Markdown 解析器
-    特殊处理：
-      - 保留标题层级作为元数据（section 信息）
-      - 移除代码块用于向量检索但保留在原文中
-    """
+    """Markdown parser. Preserves heading hierarchy as metadata; code blocks kept in original but removed for vector retrieval."""
 
     @staticmethod
     def supports(extension: str) -> bool:
@@ -143,7 +112,7 @@ class MarkdownParser(BaseDocumentParser):
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
-        # 提取标题结构
+        # extract heading structure
         sections = self._extract_headings(content)
 
         return Document(
@@ -155,7 +124,7 @@ class MarkdownParser(BaseDocumentParser):
         )
 
     def _extract_headings(self, content: str) -> List[Dict]:
-        """提取 Markdown 标题层级"""
+        """Extract Markdown heading hierarchy."""
         sections = []
         for line in content.split("\n"):
             match = re.match(r"^(#{1,6})\s+(.+)$", line)
@@ -166,10 +135,7 @@ class MarkdownParser(BaseDocumentParser):
 
 
 class PDFParser(BaseDocumentParser):
-    """
-    PDF 解析器
-    使用 pypdf 提取文本，保留页码信息
-    """
+    """PDF parser using pypdf with page number preservation."""
 
     @staticmethod
     def supports(extension: str) -> bool:
@@ -207,10 +173,7 @@ class PDFParser(BaseDocumentParser):
 
 
 class WordParser(BaseDocumentParser):
-    """
-    Word (.docx) 解析器
-    使用 python-docx 提取段落和表格
-    """
+    """Word (.docx) parser. Extracts paragraphs and tables via python-docx."""
 
     @staticmethod
     def supports(extension: str) -> bool:
@@ -226,7 +189,7 @@ class WordParser(BaseDocumentParser):
         doc = DocxDocument(str(file_path))
         parts = []
 
-        # 提取段落
+        # extract paragraphs
         for para in doc.paragraphs:
             if para.text.strip():
                 style = para.style.name if para.style else "Normal"
@@ -235,7 +198,7 @@ class WordParser(BaseDocumentParser):
                 else:
                     parts.append(para.text)
 
-        # 提取表格
+        # extract tables
         for table_idx, table in enumerate(doc.tables):
             rows = []
             for row in table.rows:
@@ -254,11 +217,9 @@ class WordParser(BaseDocumentParser):
         )
 
 
-# ============================================================================
-# 解析器注册表
-# ============================================================================
+# --- Parser registry
 class DocumentParserRegistry:
-    """解析器注册表 — 按文件扩展名自动匹配解析器"""
+    """Parser registry — auto-matches parser by file extension."""
 
     _parsers: List[BaseDocumentParser] = [
         TextParser(),
@@ -274,52 +235,27 @@ class DocumentParserRegistry:
             if parser.supports(extension):
                 return parser
         logger.warning(f"[DocumentParserRegistry] 未找到支持 {extension} 的解析器")
-        # 兜底：作为纯文本处理
+        # fallback: treat as plain text
         return TextParser()
 
     @classmethod
     def register(cls, parser: BaseDocumentParser):
-        """注册自定义解析器"""
-        cls._parsers.insert(0, parser)  # 新注册的优先
+        """Register a custom parser (inserted at front for priority)."""
+        cls._parsers.insert(0, parser)
         logger.info(f"[DocumentParserRegistry] 注册解析器: {parser.__class__.__name__}")
 
 
-# ============================================================================
-# 智能语义分块器
-# ============================================================================
+# --- Semantic chunker
 class SemanticChunker:
-    """
-    智能语义分块器 — RAG 系统的核心组件
-
-    设计原则：
-      1. 段落优先：优先在段落边界切分，不对句子拦腰截断
-      2. 语义完整：每个 chunk 包含完整的语义单元
-      3. 重叠保留：chunk_overlap 确保上下文连续性
-      4. 中文友好：支持中文标点作为分隔符
-
-    分块策略对检索精度的影响：
-      - chunk_size 过大 → 检索精度下降，噪音增加
-      - chunk_size 过小 → 语义信息不足，召回率降低
-      - overlap 过小 → 边界信息丢失
-      - overlap 过大 → 冗余信息过多，检索效率降低
-
-    推荐配置（基于实验调优）：
-      - chunk_size: 512 tokens（中英文混合场景）
-      - chunk_overlap: 64 tokens
-      - 分隔符优先级：段落 > 句子 > 子句 > 词
-    """
+    """Semantic chunker — the core RAG component. Splits at paragraph/sentence boundaries
+    first, preserves semantic completeness via overlap, and is Chinese-friendly.
+    Recommended: chunk_size=512, chunk_overlap=64 tokens."""
 
     def __init__(self, config: Optional[ChunkingConfig] = None):
         self.config = config or get_config().chunking
 
     def chunk_document(self, document: Document) -> List[Chunk]:
-        """
-        对文档进行智能分块
-
-        策略：
-          - Markdown 文档：按标题层级优先切分
-          - 普通文档：递归字符分割（RecursiveCharacterTextSplitter 思路）
-        """
+        """Chunk a document. Markdown: heading-level splitting. Generic: recursive character splitting."""
         logger.info(
             f"[SemanticChunker] 分块文档: {document.title} "
             f"(chunk_size={self.config.chunk_size}, overlap={self.config.chunk_overlap})"
@@ -348,14 +284,14 @@ class SemanticChunker:
         return chunks
 
     def _chunk_markdown(self, document: Document) -> List[Chunk]:
-        """Markdown 文档按标题 + 段落语义分块"""
+        """Chunk Markdown by heading + paragraph boundaries."""
         lines = document.content.split("\n")
         chunks = []
         current_section = ""
         current_content: List[str] = []
         char_count = 0
-        # 估算：中文约 1.5 字符/token，英文约 4 字符/token
-        max_chars = self.config.chunk_size * 2  # 粗略折中
+        # rough estimate: ~2 chars per token for mixed Chinese/English
+        max_chars = self.config.chunk_size * 2
 
         def flush_chunk():
             nonlocal current_content, char_count
@@ -374,9 +310,8 @@ class SemanticChunker:
                 },
             )
             chunks.append(chunk)
-            # 保留 overlap 部分作为下一个 chunk 的起始
+            # keep overlap portion as prefix for next chunk
             if self.config.chunk_overlap > 0:
-                # 取最后约 overlap 大小内容作为前缀
                 overlap_chars = self.config.chunk_overlap * 2
                 overlap_text = text[-overlap_chars:] if len(text) > overlap_chars else text
                 current_content = [overlap_text] if overlap_text else []
@@ -386,7 +321,7 @@ class SemanticChunker:
                 char_count = 0
 
         for line in lines:
-            # 检测标题行
+            # heading line
             if re.match(r"^#{1,6}\s+", line):
                 flush_chunk()
                 current_section = re.sub(r"^#+\s+", "", line).strip()
@@ -394,7 +329,7 @@ class SemanticChunker:
                 char_count += len(line) + 1
                 continue
 
-            # 空行 → 可能段落边界
+            # empty line = potential paragraph boundary
             if not line.strip():
                 if current_content:
                     current_content.append("")
@@ -404,20 +339,15 @@ class SemanticChunker:
             current_content.append(line)
             char_count += len(line) + 1
 
-            # 达到 chunk_size 上限
+            # chunk_size limit reached
             if char_count >= max_chars:
                 flush_chunk()
 
-        flush_chunk()  # 处理剩余内容
+        flush_chunk()  # flush remaining content
         return chunks
 
     def _chunk_generic(self, document: Document) -> List[Chunk]:
-        """
-        通用文档递归分块
-
-        借鉴 LangChain RecursiveCharacterTextSplitter 的实现思路：
-          按分隔符优先级依次尝试切分，直到每个块大小在 chunk_size 范围内。
-        """
+        """Generic recursive chunking. Tries separators in priority order until each chunk fits within chunk_size."""
         return self._recursive_split(
             text=document.content,
             document_id=document.id,
@@ -437,10 +367,10 @@ class SemanticChunker:
         separators: List[str],
         chunk_index_base: int = 0,
     ) -> List[Chunk]:
-        """递归分割核心算法"""
-        max_chars = self.config.chunk_size * 2  # token → 字符粗略转换
+        """Core recursive split algorithm."""
+        max_chars = self.config.chunk_size * 2  # token to char rough conversion
 
-        # 基础情况：文本足够小
+        # base case: text fits within limit
         if len(text) <= max_chars:
             if not text.strip():
                 return []
@@ -455,14 +385,14 @@ class SemanticChunker:
                 },
             )]
 
-        # 尝试用当前分隔符切分
+        # try splitting with current separator
         separator = separators[0] if separators else "\n"
         next_separators = separators[1:] if len(separators) > 1 else [""]
 
         if separator:
             splits = text.split(separator)
         else:
-            # 最后兜底：按字符强制切分
+            # last resort: force split by character count
             splits = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
 
         chunks: List[Chunk] = []
@@ -472,9 +402,9 @@ class SemanticChunker:
         for split in splits:
             split_len = len(split)
 
-            # 当前 split 本身超过上限 → 递归用下一级分隔符
+            # split exceeds limit → recurse with next-level separator
             if split_len > max_chars:
-                # 先保存当前批次
+                # flush current batch first
                 if current_batch.strip():
                     chunks.extend(self._recursive_split(
                         current_batch, document_id, document_title,
@@ -484,7 +414,7 @@ class SemanticChunker:
                     ))
                     current_batch = ""
                     current_char_count = 0
-                # 递归处理超长 split
+                # recursively handle oversize split
                 sub_chunks = self._recursive_split(
                     split, document_id, document_title,
                     source_path, source_type,
@@ -494,7 +424,7 @@ class SemanticChunker:
                 chunks.extend(sub_chunks)
                 continue
 
-            # 加入当前批次会超限 → 先保存当前批次
+            # adding to batch would exceed limit → flush current batch first
             if current_char_count + split_len > max_chars and current_batch.strip():
                 chunks.extend(self._recursive_split(
                     current_batch, document_id, document_title,
@@ -504,7 +434,7 @@ class SemanticChunker:
                 ))
                 current_batch = split
                 current_char_count = split_len
-                # 加上分隔符
+                # include separator
                 if separator and separator != "":
                     current_batch += separator
                     current_char_count += len(separator)
@@ -515,7 +445,7 @@ class SemanticChunker:
                 current_batch += split
                 current_char_count += split_len
 
-        # 处理最后一批
+        # flush final batch
         if current_batch.strip():
             chunks.extend(self._recursive_split(
                 current_batch, document_id, document_title,
@@ -524,21 +454,21 @@ class SemanticChunker:
                 chunk_index_base=chunk_index_base + len(chunks),
             ))
 
-        # 创建 overlap（在已生成的 chunks 间添加重叠）
+        # add overlap between adjacent chunks
         if self.config.chunk_overlap > 0 and len(chunks) > 1:
             chunks = self._add_overlap(chunks)
 
         return chunks
 
     def _add_overlap(self, chunks: List[Chunk]) -> List[Chunk]:
-        """在相邻 chunks 之间添加重叠内容"""
+        """Add overlap text between adjacent chunks."""
         overlap_chars = self.config.chunk_overlap * 2
         for i in range(1, len(chunks)):
             prev_content = chunks[i - 1].content
             if len(prev_content) > overlap_chars:
-                # 取前一个 chunk 的末尾部分作为当前 chunk 的前缀
+                # take tail of previous chunk as prefix of current chunk
                 overlap_text = prev_content[-overlap_chars:]
-                # 找到第一个完整句子边界
+                # find first complete sentence boundary
                 for sep in ["\n\n", "\n", "。", "！", "？"]:
                     if sep in overlap_text:
                         overlap_text = overlap_text[overlap_text.index(sep) + len(sep):]
@@ -548,23 +478,9 @@ class SemanticChunker:
         return chunks
 
 
-# ============================================================================
-# Embedding 生成器
-# ============================================================================
+# --- Embedding generator
 class EmbeddingGenerator:
-    """
-    文本向量化模块
-
-    支持多种 Embedding Provider：
-      - DeepSeek API（经济型）
-      - OpenAI text-embedding-3-small（推荐，1536维）
-      - 本地 bge-large-zh-v1.5（离线场景，1024维）
-
-    生产建议：
-      - 小规模（<10万条）：OpenAI text-embedding-3-small，成本低效果好
-      - 中规模（10-100万条）：DeepSeek API
-      - 大规模（>100万条）：本地部署 bge-large-zh-v1.5
-    """
+    """Text embedding. Supports DeepSeek API / OpenAI text-embedding-3-small / local (ChromaDB ONNX)."""
 
     def __init__(self):
         self.config = get_config().llm
@@ -573,19 +489,14 @@ class EmbeddingGenerator:
 
     @property
     def dimension(self) -> int:
-        """获取 Embedding 维度"""
+        """Get embedding dimension (lazy, determined from a test embedding)."""
         if self._dimension is None:
-            # 生成一个测试 embedding 确定维度
             test_embedding = self.embed("test")
             self._dimension = len(test_embedding)
         return self._dimension
 
     def embed(self, text: str) -> List[float]:
-        """
-        文本向量化（单条）
-
-        内置缓存：相同文本不重复调用 API
-        """
+        """Embed a single text. Built-in cache avoids duplicate API calls."""
         cache_key = hashlib.md5(text.encode("utf-8")).hexdigest()
         if cache_key in self._embedding_cache:
             return self._embedding_cache[cache_key]
@@ -604,18 +515,14 @@ class EmbeddingGenerator:
         return embedding
 
     def embed_batch(self, texts: List[str], batch_size: int = 20) -> List[List[float]]:
-        """
-        批量文本向量化
-
-        批量处理减少 API 调用次数，降低成本。
-        """
+        """Batch embed texts to reduce API calls and cost."""
         logger.info(f"[EmbeddingGenerator] 批量向量化 {len(texts)} 条文本")
 
         all_embeddings = []
         uncached = []
         uncached_indices = []
 
-        # 先检查缓存
+        # check cache first
         for i, text in enumerate(texts):
             cache_key = hashlib.md5(text.encode("utf-8")).hexdigest()
             if cache_key in self._embedding_cache:
@@ -623,12 +530,12 @@ class EmbeddingGenerator:
             else:
                 uncached.append(text)
                 uncached_indices.append(i)
-                all_embeddings.append(None)  # 占位
+                all_embeddings.append(None)  # placeholder
 
         if not uncached:
             return all_embeddings
 
-        # 批量调用 API
+        # batch API calls
         for batch_start in range(0, len(uncached), batch_size):
             batch = uncached[batch_start:batch_start + batch_size]
             batch_embeddings = self._embed_batch_api(batch)
@@ -643,7 +550,7 @@ class EmbeddingGenerator:
         return all_embeddings
 
     def _embed_openai(self, text: str) -> List[float]:
-        """OpenAI Embedding API"""
+        """OpenAI Embedding API call."""
         from openai import OpenAI
         client = OpenAI(api_key=self.config.openai_api_key)
         response = client.embeddings.create(
@@ -653,7 +560,7 @@ class EmbeddingGenerator:
         return response.data[0].embedding
 
     def _embed_batch_api(self, texts: List[str]) -> List[List[float]]:
-        """批量 Embedding API 调用"""
+        """Batch embedding API call."""
         if self.config.embedding_provider == "openai":
             from openai import OpenAI
             client = OpenAI(api_key=self.config.openai_api_key)
@@ -667,47 +574,32 @@ class EmbeddingGenerator:
             return [self.embed(text) for text in texts]
 
     def _embed_deepseek(self, text: str) -> List[float]:
-        """
-        DeepSeek Embedding（暂用 Chat API 的 hidden states 近似）
-        注意：DeepSeek 目前未提供专用 Embedding API，此方法为近似实现。
-        生产环境建议切换到 OpenAI Embedding 或本地模型。
-        """
+        """DeepSeek embedding fallback. DeepSeek has no dedicated Embedding API yet,
+        so this method falls back to OpenAI. In production, switch to 'openai' or 'local'."""
         logger.warning(
             "[EmbeddingGenerator] DeepSeek 暂未提供专用 Embedding API，"
             "建议将 embedding_provider 设为 'openai' 或 'local'"
         )
-        # 兜底：使用简单的哈希特征（仅用于演示，生产不可用）
-        # 生产环境请使用 OpenAI 或本地 BGE 模型
-        return self._embed_openai(text)  # 自动回退到 OpenAI
+        # fall back to OpenAI embedding
+        return self._embed_openai(text)
 
     def _embed_local(self, text: str) -> List[float]:
-        """
-        本地 Embedding — 使用 ChromaDB 内置 ONNX 模型 (all-MiniLM-L6-v2)
-        无需 API Key，无需安装额外依赖，完全免费
-        """
-        # 懒加载 ChromaDB 默认 embedding 函数
+        """Local embedding via ChromaDB built-in ONNX model (all-MiniLM-L6-v2).
+        No API key or additional dependencies needed."""
+        # lazy-load ChromaDB default embedding function
         if not hasattr(self, "_chromadb_ef"):
             from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
             logger.info("[EmbeddingGenerator] 加载 ChromaDB 内置 ONNX Embedding 模型...")
             self._chromadb_ef = DefaultEmbeddingFunction()
 
         embedding = self._chromadb_ef([text])
-        return embedding[0]  # 返回第一个（也是唯一一个）embedding
+        return embedding[0]
 
 
-# ============================================================================
-# 向量数据库管理
-# ============================================================================
+# --- Vector store manager
 class VectorStoreManager:
-    """
-    ChromaDB 向量数据库管理器
-
-    核心功能：
-      - 文档批量索引（解析 → 分块 → 向量化 → 存储）
-      - 增量索引（检测变更，仅更新变化的 chunk）
-      - 文档删除（级联删除所有 chunk）
-      - Collection 管理（多知识库隔离）
-    """
+    """ChromaDB vector database manager. Supports batch/indexing, incremental indexing,
+    document deletion, and multi-collection isolation."""
 
     def __init__(self, collection_name: str = "deepservice_knowledge"):
         self.collection_name = collection_name
@@ -716,13 +608,13 @@ class VectorStoreManager:
         import chromadb
         from chromadb.config import Settings
 
-        # 持久化存储
+        # persistent storage
         db_path = str(self.config.app.vector_db_dir)
         self.client = chromadb.PersistentClient(
             path=db_path,
             settings=Settings(
-                anonymized_telemetry=False,     # 不上报数据
-                allow_reset=True,               # 允许重置（开发阶段）
+                anonymized_telemetry=False,
+                allow_reset=True,
             ),
         )
 
@@ -733,7 +625,7 @@ class VectorStoreManager:
         )
 
     def _get_or_create_collection(self):
-        """获取或创建 Collection"""
+        """Get or create the ChromaDB collection."""
         try:
             return self.client.get_collection(self.collection_name)
         except Exception:
@@ -743,19 +635,15 @@ class VectorStoreManager:
                 metadata={
                     "description": "DeepService 企业智能客服知识库",
                     "created_at": "",
-                    "hnsw:space": "cosine",  # 余弦相似度
+                    "hnsw:space": "cosine",
                 },
             )
 
     def index_document(self, document: Document) -> List[Chunk]:
-        """
-        索引单个文档（解析 → 分块 → 向量化 → 存储）
-
-        返回: 生成的所有 Chunk
-        """
+        """Index a single document: chunk → embed → store. Returns all generated Chunks."""
         logger.info(f"[VectorStoreManager] 索引文档: {document.title}")
 
-        # Step 1: 语义分块
+        # Step 1: semantic chunking
         chunker = SemanticChunker()
         chunks = chunker.chunk_document(document)
 
@@ -763,7 +651,7 @@ class VectorStoreManager:
             logger.warning(f"[VectorStoreManager] 文档 {document.title} 未生成有效 chunk")
             return []
 
-        # Step 2: 向量化
+        # Step 2: embed
         embedder = EmbeddingGenerator()
         texts = [c.content for c in chunks]
         embeddings = embedder.embed_batch(texts)
@@ -771,7 +659,7 @@ class VectorStoreManager:
         for chunk, embedding in zip(chunks, embeddings):
             chunk.embedding = embedding
 
-        # Step 3: 存入 ChromaDB
+        # Step 3: store in ChromaDB
         self.collection.add(
             ids=[c.id for c in chunks],
             embeddings=[c.embedding for c in chunks],
@@ -786,11 +674,7 @@ class VectorStoreManager:
         return chunks
 
     def index_documents(self, documents: List[Document]) -> Dict[str, int]:
-        """
-        批量索引文档
-
-        返回: {"indexed": N, "failed": N, "total_chunks": N}
-        """
+        """Index multiple documents. Returns {"indexed": N, "failed": N, "total_chunks": N}."""
         logger.info(f"[VectorStoreManager] 批量索引 {len(documents)} 个文档")
         total_chunks = 0
         indexed = 0
@@ -808,14 +692,11 @@ class VectorStoreManager:
         return {"indexed": indexed, "failed": failed, "total_chunks": total_chunks}
 
     def index_file(self, file_path: Path) -> List[Chunk]:
-        """
-        索引单个文件（自动解析 → 索引）
+        """Index a single file: auto-detect parser → index.
 
-        使用示例：
-            vs = VectorStoreManager()
-            chunks = vs.index_file(Path("./knowledge_base/faq.md"))
+        Usage: vs = VectorStoreManager(); chunks = vs.index_file(Path("./knowledge_base/faq.md"))
         """
-        # 解析文档
+        # parse document
         parser = DocumentParserRegistry.get_parser(file_path)
         if parser is None:
             raise ValueError(f"无法解析文件: {file_path}（不支持的格式）")
@@ -824,24 +705,14 @@ class VectorStoreManager:
         return self.index_document(document)
 
     def index_directory(self, directory: Path, recursive: bool = True) -> Dict[str, int]:
-        """
-        索引整个目录
-
-        参数：
-          directory: 知识库目录路径
-          recursive: 是否递归子目录
-        """
+        """Index all supported documents in a directory (recursive by default)."""
         logger.info(f"[VectorStoreManager] 索引目录: {directory}")
         documents = self._load_documents_from_dir(directory, recursive)
         return self.index_documents(documents)
 
     def delete_document(self, document_id: str) -> int:
-        """
-        删除文档及其所有 chunk
-
-        返回: 删除的 chunk 数量
-        """
-        # 先查询该文档的所有 chunk
+        """Delete a document and all its chunks. Returns deleted chunk count."""
+        # query all chunks for this document
         results = self.collection.get(
             where={"document_id": document_id},
             include=["metadatas"],
@@ -862,14 +733,7 @@ class VectorStoreManager:
         top_k: int = 5,
         where_filter: Optional[Dict] = None,
     ) -> List[Dict]:
-        """
-        向量语义检索
-
-        参数：
-          query_embedding: 查询向量
-          top_k: 返回数量
-          where_filter: 元数据过滤条件（如 {"source_type": "md"}）
-        """
+        """Vector semantic search. Supports metadata filtering via where_filter (e.g., {"source_type": "md"})."""
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
@@ -877,12 +741,12 @@ class VectorStoreManager:
             include=["documents", "metadatas", "distances"],
         )
 
-        # 标准化返回格式
+        # normalize return format
         formatted = []
         if results["ids"] and results["ids"][0]:
             for i, chunk_id in enumerate(results["ids"][0]):
                 distance = results["distances"][0][i]
-                # ChromaDB cosine distance → similarity (1 - distance)
+                # ChromaDB cosine distance -> similarity (1 - distance)
                 similarity = 1.0 - distance
                 formatted.append({
                     "id": chunk_id,
@@ -894,7 +758,7 @@ class VectorStoreManager:
         return formatted
 
     def get_collection_stats(self) -> Dict:
-        """获取知识库统计信息"""
+        """Get collection statistics."""
         count = self.collection.count()
         return {
             "collection_name": self.collection_name,
@@ -902,7 +766,7 @@ class VectorStoreManager:
         }
 
     def reset_collection(self):
-        """重置知识库（危险操作，仅开发环境）"""
+        """Reset the collection (dangerous — dev only)."""
         logger.warning(f"[VectorStoreManager] 重置 Collection: {self.collection_name}")
         try:
             self.client.delete_collection(self.collection_name)
@@ -915,7 +779,7 @@ class VectorStoreManager:
         directory: Path,
         recursive: bool = True,
     ) -> List[Document]:
-        """从目录批量加载文档"""
+        """Load documents from a directory (with extension filter)."""
         documents = []
         pattern = "**/*" if recursive else "*"
         supported_extensions = {".txt", ".md", ".markdown", ".pdf", ".docx"}
@@ -925,7 +789,7 @@ class VectorStoreManager:
                 continue
             if file_path.suffix.lower() not in supported_extensions:
                 continue
-            # 跳过隐藏文件
+            # skip hidden files
             if file_path.name.startswith("."):
                 continue
 
@@ -941,20 +805,10 @@ class VectorStoreManager:
         return documents
 
 
-# ============================================================================
-# 独立测试入口
-# ============================================================================
+# --- Self-check
 if __name__ == "__main__":
-    """
-    快速验证数据层功能：
-
-        python data_layer.py
-
-    确保在项目目录下创建 knowledge_base/ 目录并放入测试文档。
-    """
-    logger.info("=" * 60)
-    logger.info("DeepService Data Layer — 独立测试")
-    logger.info("=" * 60)
+    """Quick self-check. Run: python data_layer.py"""
+    logger.info("DeepService Data Layer — self-check")
 
     # 1. 测试文档解析
     test_dir = get_config().app.knowledge_dir
@@ -996,5 +850,4 @@ if __name__ == "__main__":
     for c in chunks:
         logger.info(f"Chunk {c.chunk_index}: {len(c.content)} 字符 | 来源: {c.metadata.get('section', 'N/A')}")
 
-    logger.info("=" * 60)
-    logger.info("数据层测试完成 ✓")
+    logger.info("Data layer self-check complete.")

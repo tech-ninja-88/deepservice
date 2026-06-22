@@ -1,26 +1,6 @@
 """
-=============================================================================
-DeepService 对话管理 — 会话管理模块 (Session Manager)
-=============================================================================
-职责：
-  1. 会话生命周期管理（创建 → 活跃 → 转人工 → 关闭）
-  2. Redis 存储会话状态（生产） / 内存存储（开发）
-  3. 会话 TTL 过期策略（自动清理僵尸会话）
-  4. 会话元数据追踪（用户标识、渠道、设备信息）
-
-企业级设计原则：
-  - 会话是对话管理的原子单元，所有消息和状态依附于会话
-  - Redis 作为主要存储保证服务无状态可水平扩展
-  - 会话超时机制防止资源泄露
-  - 优雅的降级：Redis 不可用时自动切换到内存存储
-
-存储结构设计（Redis）：
-  session:{id}:info       → Hash   — 会话元信息（状态、创建时间、用户ID等）
-  session:{id}:messages   → List   — 消息历史（JSON序列化）
-  session:{id}:state      → Hash   — 对话状态机当前状态
-  session:{id}:slots      → Hash   — 槽位填充数据
-  session:{id}:ttl        → 1800s  — 整体会话 TTL
-=============================================================================
+Session lifecycle manager: create, track, expire, and close sessions.
+Redis is the primary store with automatic fallback to in-memory dict.
 """
 
 import json
@@ -38,40 +18,36 @@ from loguru import logger
 from config import get_config
 
 
-# ============================================================================
-# 枚举定义
-# ============================================================================
+# ___ Session status enum
 class SessionStatus(str, Enum):
-    """会话状态枚举"""
-    ACTIVE = "active"               # 活跃中（用户正在对话）
-    IDLE = "idle"                   # 空闲（超过5分钟无活动但未关闭）
-    WAITING_TRANSFER = "waiting"    # 等待转接人工
-    IN_HUMAN_SERVICE = "human"      # 人工坐席服务中
-    CLOSED = "closed"               # 已关闭
-    EXPIRED = "expired"             # 已过期（系统自动关闭）
-    ERROR = "error"                 # 异常状态
+    """Session lifecycle states"""
+    ACTIVE = "active"               # user is actively chatting
+    IDLE = "idle"                   # no activity > 5 min, not yet closed
+    WAITING_TRANSFER = "waiting"    # waiting to be transferred to human
+    IN_HUMAN_SERVICE = "human"      # being served by human agent
+    CLOSED = "closed"               # closed
+    EXPIRED = "expired"             # auto-expired by system
+    ERROR = "error"                 # abnormal state
 
 
 class MessageRole(str, Enum):
-    """消息角色"""
+    """Sender roles in a conversation"""
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
     HUMAN_AGENT = "human_agent"
 
 
-# ============================================================================
-# 数据结构
-# ============================================================================
+# ___ Data structures
 @dataclass
 class Message:
-    """单条消息"""
+    """A single message in a conversation"""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     role: MessageRole = MessageRole.USER
     content: str = ""
     timestamp: float = field(default_factory=time.time)
     metadata: Dict = field(default_factory=dict)
-    # 元数据可包含：intent, confidence, tokens, sources, feedback 等
+    # metadata may include: intent, confidence, tokens, sources, feedback
 
     def to_dict(self) -> Dict:
         return {
@@ -95,26 +71,26 @@ class Message:
 
 @dataclass
 class Session:
-    """会话对象"""
+    """A conversation session"""
     id: str = field(default_factory=lambda: f"sess_{uuid.uuid4().hex[:12]}")
     user_id: str = "anonymous"
     status: SessionStatus = SessionStatus.ACTIVE
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     closed_at: Optional[float] = None
-    ttl: int = 1800                           # 默认 30 分钟过期
+    ttl: int = 1800                           # default 30 min expiry
 
-    # 元信息
-    channel: str = "web"                      # 渠道：web / mobile / api / wechat
-    locale: str = "zh-CN"                     # 语言
-    user_agent: str = ""                      # 设备信息
-    ip_address: str = ""                      # 客户端 IP
+    # meta info
+    channel: str = "web"                      # web / mobile / api / wechat
+    locale: str = "zh-CN"                     # language
+    user_agent: str = ""                      # device info
+    ip_address: str = ""                      # client IP
 
-    # 统计
-    message_count: int = 0                    # 消息总数
-    turn_count: int = 0                       # 对话轮数（一问一答算一轮）
+    # counters
+    message_count: int = 0
+    turn_count: int = 0                       # one user+assistant exchange = 1 turn
 
-    # 最后一条消息时间（用于空闲检测）
+    # last message timestamps for idle detection
     last_user_message_at: float = 0.0
     last_assistant_message_at: float = 0.0
 
@@ -130,6 +106,7 @@ class Session:
             "channel": self.channel,
             "locale": self.locale,
             "user_agent": self.user_agent,
+            "ip_address": self.ip_address,
             "message_count": self.message_count,
             "turn_count": self.turn_count,
             "last_user_message_at": self.last_user_message_at,
@@ -149,6 +126,7 @@ class Session:
             channel=data.get("channel", "web"),
             locale=data.get("locale", "zh-CN"),
             user_agent=data.get("user_agent", ""),
+            ip_address=data.get("ip_address", ""),
             message_count=data.get("message_count", 0),
             turn_count=data.get("turn_count", 0),
             last_user_message_at=data.get("last_user_message_at", 0.0),
@@ -157,20 +135,18 @@ class Session:
 
     @property
     def is_expired(self) -> bool:
-        """判断会话是否过期"""
+        """True if the session has exceeded its TTL"""
         return (time.time() - self.updated_at) > self.ttl
 
     @property
     def idle_seconds(self) -> float:
-        """空闲时长（秒）"""
+        """Seconds since last user message"""
         return time.time() - self.last_user_message_at
 
 
-# ============================================================================
-# 存储后端抽象
-# ============================================================================
+# ___ Storage backend abstraction
 class SessionStoreBackend(ABC):
-    """会话存储后端抽象基类"""
+    """Abstract base for session storage backends"""
 
     @abstractmethod
     def get_session(self, session_id: str) -> Optional[Dict]:
@@ -207,12 +183,8 @@ class SessionStoreBackend(ABC):
 
 class RedisSessionStore(SessionStoreBackend):
     """
-    Redis 会话存储
-
-    存储结构：
-      session:{id}:info     → Hash   — 会话元信息
-      session:{id}:messages → List   — 消息列表（JSON）
-      session:index         → Sorted Set — 活跃会话索引（按更新时间排序）
+    Redis-backed session storage.
+    Keys: session:{id}:info (Hash), session:{id}:messages (List), session:index (Sorted Set).
     """
 
     def __init__(self, redis_url: Optional[str] = None):
@@ -221,7 +193,7 @@ class RedisSessionStore(SessionStoreBackend):
         self._connect()
 
     def _connect(self):
-        """连接 Redis"""
+        """Establish Redis connection"""
         try:
             import redis
             self._redis = redis.Redis.from_url(
@@ -231,10 +203,10 @@ class RedisSessionStore(SessionStoreBackend):
                 socket_connect_timeout=5,
             )
             self._redis.ping()
-            logger.info(f"[RedisSessionStore] Redis 连接成功: {self.redis_url}")
+            logger.info(f"[RedisSessionStore] Redis connected: {self.redis_url}")
         except Exception as e:
-            logger.error(f"[RedisSessionStore] Redis 连接失败: {e}")
-            raise ConnectionError(f"无法连接 Redis: {e}")
+            logger.error(f"[RedisSessionStore] Redis connection failed: {e}")
+            raise ConnectionError(f"Failed to connect Redis: {e}")
 
     def _key_info(self, session_id: str) -> str:
         return f"session:{session_id}:info"
@@ -250,36 +222,36 @@ class RedisSessionStore(SessionStoreBackend):
             data = self._redis.hgetall(self._key_info(session_id))
             if not data:
                 return None
-            # 类型转换
+            # type conversion
             for int_field in ["message_count", "turn_count", "ttl"]:
                 if int_field in data:
                     data[int_field] = int(data[int_field])
             for float_field in ["created_at", "updated_at", "closed_at",
                                 "last_user_message_at", "last_assistant_message_at"]:
-                if float_field in data and data[float_field]:
+                if float_field in data and data[float_field] is not None and data[float_field] != "":
                     data[float_field] = float(data[float_field])
             return data
         except Exception as e:
-            logger.error(f"[RedisSessionStore] 获取会话失败 {session_id}: {e}")
+            logger.error(f"[RedisSessionStore] get_session failed {session_id}: {e}")
             return None
 
     def save_session(self, session: Session) -> bool:
         try:
             session.updated_at = time.time()
             data = session.to_dict()
-            # 转换所有值为字符串（Redis Hash 要求）
+            # Convert all values to strings (Redis Hash requirement)
             str_data = {k: str(v) if v is not None else "" for k, v in data.items()}
 
             pipe = self._redis.pipeline()
             pipe.hset(self._key_info(session.id), mapping=str_data)
             pipe.expire(self._key_info(session.id), session.ttl)
             pipe.expire(self._key_messages(session.id), session.ttl)
-            # 更新活跃索引
+            # Update active index
             pipe.zadd(self._key_index(), {session.id: time.time()})
             pipe.execute()
             return True
         except Exception as e:
-            logger.error(f"[RedisSessionStore] 保存会话失败 {session.id}: {e}")
+            logger.error(f"[RedisSessionStore] save_session failed {session.id}: {e}")
             return False
 
     def delete_session(self, session_id: str) -> bool:
@@ -289,10 +261,10 @@ class RedisSessionStore(SessionStoreBackend):
             pipe.delete(self._key_messages(session_id))
             pipe.zrem(self._key_index(), session_id)
             pipe.execute()
-            logger.info(f"[RedisSessionStore] 会话已删除: {session_id}")
+            logger.info(f"[RedisSessionStore] Session deleted: {session_id}")
             return True
         except Exception as e:
-            logger.error(f"[RedisSessionStore] 删除会话失败 {session_id}: {e}")
+            logger.error(f"[RedisSessionStore] delete_session failed {session_id}: {e}")
             return False
 
     def get_messages(self, session_id: str, limit: int = 50) -> List[Dict]:
@@ -302,7 +274,7 @@ class RedisSessionStore(SessionStoreBackend):
             )
             return [json.loads(m) for m in raw_messages]
         except Exception as e:
-            logger.error(f"[RedisSessionStore] 获取消息失败 {session_id}: {e}")
+            logger.error(f"[RedisSessionStore] get_messages failed {session_id}: {e}")
             return []
 
     def append_message(self, session_id: str, message: Message) -> bool:
@@ -311,13 +283,13 @@ class RedisSessionStore(SessionStoreBackend):
             pipe.rpush(self._key_messages(session_id), json.dumps(
                 message.to_dict(), ensure_ascii=False
             ))
-            # 保持消息列表不超过 500 条（防止内存溢出）
+            # Cap message list at 500 entries (prevent memory overflow)
             pipe.ltrim(self._key_messages(session_id), -500, -1)
             pipe.expire(self._key_messages(session_id), 3600)
             pipe.execute()
             return True
         except Exception as e:
-            logger.error(f"[RedisSessionStore] 追加消息失败 {session_id}: {e}")
+            logger.error(f"[RedisSessionStore] append_message failed {session_id}: {e}")
             return False
 
     def refresh_ttl(self, session_id: str) -> bool:
@@ -333,7 +305,7 @@ class RedisSessionStore(SessionStoreBackend):
 
     def list_active_sessions(self, limit: int = 100) -> List[str]:
         try:
-            # 获取最近更新的会话
+            # Get most recently updated sessions
             return self._redis.zrevrange(
                 self._key_index(), 0, limit - 1
             )
@@ -354,23 +326,21 @@ class RedisSessionStore(SessionStoreBackend):
 
 class MemorySessionStore(SessionStoreBackend):
     """
-    内存会话存储（开发环境 / Redis 降级）
-
-    使用线程安全的字典存储，服务重启后数据丢失。
-    生产环境必须使用 Redis。
+    In-memory session store (dev / Redis fallback).
+    Thread-safe dict storage; data lost on restart.
     """
 
     def __init__(self):
         self._sessions: Dict[str, Dict] = {}
         self._messages: Dict[str, List[Dict]] = {}
         self._lock = threading.Lock()
-        logger.warning("[MemorySessionStore] 使用内存存储，服务重启后数据将丢失！")
+        logger.warning("[MemorySessionStore] Using in-memory storage — data will be lost on restart!")
 
     def get_session(self, session_id: str) -> Optional[Dict]:
         with self._lock:
             data = self._sessions.get(session_id)
             if data:
-                # 检查过期
+                # Check expiry
                 ttl = data.get("ttl", 1800)
                 if time.time() - data.get("updated_at", 0) > ttl:
                     self.delete_session(session_id)
@@ -400,7 +370,7 @@ class MemorySessionStore(SessionStoreBackend):
             if session_id not in self._messages:
                 self._messages[session_id] = []
             self._messages[session_id].append(message.to_dict())
-            # 保持最近 500 条
+            # Keep last 500 messages
             if len(self._messages[session_id]) > 500:
                 self._messages[session_id] = self._messages[session_id][-500:]
             return True
@@ -428,18 +398,12 @@ class MemorySessionStore(SessionStoreBackend):
             }
 
 
-# ============================================================================
-# 会话管理器
-# ============================================================================
+# ___ Session manager
 class SessionManager:
     """
-    会话管理器 — 对外唯一接口
-
-    特性：
-      - 自动选择存储后端（Redis 优先，失败降级到内存）
-      - 会话 TTL 管理（默认 30 分钟自动过期）
-      - 空闲会话自动清理
-      - 线程安全
+    Session manager — the single public interface.
+    Auto-selects backend (Redis first, degrades to memory).
+    Manages TTL, idle cleanup, thread-safe.
     """
 
     def __init__(self, redis_url: Optional[str] = None):
@@ -447,33 +411,33 @@ class SessionManager:
         self._store = self._init_store(redis_url)
         self._cleanup_thread = None
 
-        # 统计
+        # counters
         self._sessions_created = 0
         self._sessions_closed = 0
 
-        logger.info(f"[SessionManager] 初始化完成，后端: {self._store.get_stats().get('backend', 'unknown')}")
+        logger.info(f"[SessionManager] Initialized, backend: {self._store.get_stats().get('backend', 'unknown')}")
 
     def _init_store(self, redis_url: Optional[str] = None) -> SessionStoreBackend:
-        """初始化存储后端（Redis 优先，降级到内存）"""
-        # 如果明确提供了 Redis URL，直接使用
+        """Initialize storage backend (Redis first, fallback to memory)"""
+        # If Redis URL is explicitly provided, use it directly
         if redis_url:
             try:
                 return RedisSessionStore(redis_url)
             except Exception:
-                logger.warning("Redis 不可用，降级到内存存储")
+                logger.warning("Redis unavailable, falling back to memory storage")
 
-        # 尝试环境变量中的 Redis URL
+        # Try Redis URL from environment variables
         import os
         env_redis = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_URL")
         if env_redis:
             try:
                 return RedisSessionStore(env_redis)
             except Exception:
-                logger.warning("Redis 不可用，降级到内存存储")
+                logger.warning("Redis unavailable, falling back to memory storage")
 
         return MemorySessionStore()
 
-    # ──── Session CRUD ────
+    # ___ Session CRUD
 
     def create_session(
         self,
@@ -484,17 +448,7 @@ class SessionManager:
         ip_address: str = "",
         ttl: int = 1800,
     ) -> Session:
-        """
-        创建新会话
-
-        参数:
-          user_id: 用户标识（可匿名）
-          channel: 渠道来源
-          ttl: 过期时间（秒），默认 30 分钟
-
-        返回:
-          Session 对象
-        """
+        """Create a new session. Returns the Session object."""
         session = Session(
             user_id=user_id,
             channel=channel,
@@ -507,25 +461,23 @@ class SessionManager:
         if success:
             self._sessions_created += 1
             logger.info(
-                f"[SessionManager] 会话创建: {session.id} "
+                f"[SessionManager] Session created: {session.id} "
                 f"(user={user_id}, channel={channel}, ttl={ttl}s)"
             )
         else:
-            logger.error(f"[SessionManager] 会话创建失败: {session.id}")
+            logger.error(f"[SessionManager] Failed to create session: {session.id}")
         return session
 
     def get_session(self, session_id: str) -> Optional[Session]:
         """
-        获取会话
-
-        如果会话已过期，自动标记为 EXPIRED 并返回 None。
+        Retrieve a session. If expired, auto-marks as EXPIRED and returns None.
         """
         data = self._store.get_session(session_id)
         if not data:
             return None
         session = Session.from_dict(data)
         if session.is_expired:
-            logger.info(f"[SessionManager] 会话已过期: {session_id}")
+            logger.info(f"[SessionManager] Session expired: {session_id}")
             self.close_session(session_id, reason="expired")
             return None
         return session
@@ -537,9 +489,7 @@ class SessionManager:
         **kwargs,
     ) -> Tuple[Session, bool]:
         """
-        获取或创建会话
-
-        返回: (Session, is_new) — is_new 表示是否新创建
+        Get or create a session. Returns (Session, is_new).
         """
         if session_id:
             session = self.get_session(session_id)
@@ -550,11 +500,11 @@ class SessionManager:
         return session, True
 
     def update_session(self, session: Session) -> bool:
-        """更新会话信息"""
+        """Save updated session info"""
         return self._store.save_session(session)
 
     def update_status(self, session_id: str, status: SessionStatus) -> bool:
-        """更新会话状态"""
+        """Update session status"""
         session = self.get_session(session_id)
         if not session:
             return False
@@ -565,17 +515,15 @@ class SessionManager:
 
     def close_session(self, session_id: str, reason: str = "user_requested") -> bool:
         """
-        关闭会话
-
-        原因选项: user_requested, expired, transferred, error
+        Close a session. Reason options: user_requested, expired, transferred, error.
         """
         session = self.get_session(session_id)
         if not session:
             return False
 
-        # 如果转人工了，不直接关闭
+        # If in human service, don't close directly
         if session.status == SessionStatus.IN_HUMAN_SERVICE and reason != "transferred":
-            logger.info(f"[SessionManager] 会话 {session_id} 在人工服务中，标记为转为已关闭")
+            logger.info(f"[SessionManager] Session {session_id} in human service, marking as closed")
             session.status = SessionStatus.CLOSED
             session.closed_at = time.time()
         else:
@@ -585,25 +533,25 @@ class SessionManager:
         success = self._store.save_session(session)
         if success:
             self._sessions_closed += 1
-            logger.info(f"[SessionManager] 会话关闭: {session_id} (原因: {reason})")
+            logger.info(f"[SessionManager] Session closed: {session_id} (reason: {reason})")
         return success
 
     def delete_session(self, session_id: str) -> bool:
-        """物理删除会话"""
+        """Physically delete a session"""
         return self._store.delete_session(session_id)
 
     def refresh_session(self, session_id: str) -> bool:
-        """续期会话 TTL"""
+        """Refresh session TTL"""
         return self._store.refresh_ttl(session_id)
 
-    # ──── Message 管理 ────
+    # ___ Message management
 
     def append_message(self, session_id: str, message: Message) -> bool:
-        """追加一条消息到会话"""
+        """Append a message to the session"""
         success = self._store.append_message(session_id, message)
 
         if success:
-            # 更新会话统计
+            # Update session counters
             session = self.get_session(session_id)
             if session:
                 session.message_count += 1
@@ -614,7 +562,7 @@ class SessionManager:
                     session.last_assistant_message_at = time.time()
                 self._store.save_session(session)
 
-            # 续期
+            # Refresh TTL
             self._store.refresh_ttl(session_id)
 
         return success
@@ -626,11 +574,7 @@ class SessionManager:
         offset: int = 0,
     ) -> List[Message]:
         """
-        获取会话消息
-
-        参数:
-          limit: 返回条数
-          offset: 偏移量（0 = 最新）
+        Retrieve session messages. offset=0 means most recent.
         """
         raw = self._store.get_messages(session_id, limit + offset)
         messages = [Message.from_dict(m) for m in raw]
@@ -643,7 +587,7 @@ class SessionManager:
         session_id: str,
         n: int = 10,
     ) -> List[Message]:
-        """获取最近 N 条消息（常用）"""
+        """Get last N messages (convenience method)"""
         return self.get_messages(session_id, limit=n, offset=0)
 
     def get_last_n_turns(
@@ -652,9 +596,7 @@ class SessionManager:
         n: int = 5,
     ) -> List[Tuple[Message, Optional[Message]]]:
         """
-        获取最近 N 轮对话（配对用户-助手消息）
-
-        返回: [(user_msg, assistant_msg), ...]
+        Get last N turns as paired (user_msg, assistant_msg) tuples.
         """
         messages = self.get_messages(session_id, limit=n * 2 + 5)
         turns = []
@@ -669,7 +611,7 @@ class SessionManager:
 
         return turns[-n:] if len(turns) > n else turns
 
-    # ──── 管理与统计 ────
+    # ___ Management & stats
 
     def list_sessions(
         self,
@@ -677,7 +619,7 @@ class SessionManager:
         status: Optional[SessionStatus] = None,
         limit: int = 50,
     ) -> List[Session]:
-        """列出会话（可筛选）"""
+        """List sessions with optional filters"""
         active_ids = self._store.list_active_sessions(limit)
         sessions = []
         for sid in active_ids:
@@ -691,7 +633,7 @@ class SessionManager:
         return sessions
 
     def cleanup_expired_sessions(self) -> int:
-        """清理过期会话"""
+        """Clean up expired sessions"""
         active_ids = self._store.list_active_sessions(500)
         cleaned = 0
         for sid in active_ids:
@@ -700,11 +642,11 @@ class SessionManager:
                 self.close_session(sid, reason="expired")
                 cleaned += 1
         if cleaned > 0:
-            logger.info(f"[SessionManager] 清理了 {cleaned} 个过期会话")
+            logger.info(f"[SessionManager] Cleaned up {cleaned} expired sessions")
         return cleaned
 
     def get_stats(self) -> Dict:
-        """获取统计信息"""
+        """Get aggregate statistics"""
         store_stats = self._store.get_stats()
         return {
             **store_stats,
@@ -714,15 +656,13 @@ class SessionManager:
         }
 
 
-# ============================================================================
-# 全局单例
-# ============================================================================
+# Global session manager — double-checked locking for thread safety at startup
+
 _session_manager: Optional[SessionManager] = None
 _lock = threading.Lock()
 
 
 def get_session_manager() -> SessionManager:
-    """获取全局 SessionManager 单例"""
     global _session_manager
     if _session_manager is None:
         with _lock:
@@ -731,43 +671,32 @@ def get_session_manager() -> SessionManager:
     return _session_manager
 
 
-# ============================================================================
-# 独立测试
-# ============================================================================
+# ___ Self-check
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("DeepService Session Manager — 独立测试")
-    logger.info("=" * 60)
-
+    logger.info("Session Manager self-check")
     sm = SessionManager()
 
-    # 测试1：创建会话
+    # Test 1: Create session
     session, is_new = sm.get_or_create_session(user_id="test_user_001")
-    logger.info(f"[测试1] 创建会话: {session.id} (新会话={is_new})")
+    logger.info(f"  Created: {session.id} (new={is_new})")
 
-    # 测试2：追加消息
+    # Test 2: Append messages
     sm.append_message(session.id, Message(role=MessageRole.USER, content="我的订单12345发货了吗？"))
     sm.append_message(session.id, Message(role=MessageRole.ASSISTANT, content="让我帮您查询订单#12345的状态..."))
-    logger.info(f"[测试2] 追加消息后 message_count={session.message_count}")
+    logger.info(f"  Messages appended, count={session.message_count}")
 
-    # 测试3：获取最近消息
+    # Test 3: Get recent messages
     messages = sm.get_recent_messages(session.id, n=5)
-    logger.info(f"[测试3] 最近消息数: {len(messages)}")
-    for msg in messages:
-        logger.info(f"  [{msg.role.value}] {msg.content[:50]}...")
+    logger.info(f"  Recent messages: {len(messages)}")
 
-    # 测试4：获取对话轮次
+    # Test 4: Get turns
     turns = sm.get_last_n_turns(session.id, n=3)
-    logger.info(f"[测试4] 对话轮数: {len(turns)}")
+    logger.info(f"  Turns: {len(turns)}")
 
-    # 测试5：会话统计
+    # Test 5: Stats
     stats = sm.get_stats()
-    logger.info(f"[测试5] 统计: {stats}")
+    logger.info(f"  Stats: backend={stats.get('backend')}, sessions={stats.get('total_active_sessions')}")
 
-    # 测试6：关闭会话
+    # Test 6: Close session
     sm.close_session(session.id, reason="test_done")
-    closed = sm.get_session(session.id)
-    logger.info(f"[测试6] 关闭后状态: {closed.status.value if closed else 'N/A'}")
-
-    logger.info("=" * 60)
-    logger.info("会话管理测试完成 ✓")
+    logger.info("Session manager self-check complete.")

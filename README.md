@@ -238,7 +238,7 @@ deepservice/
 
 ## 📝 License
 
-MIT License — 仅用于个人学习、面试展示。
+MIT License
 
 ---
 

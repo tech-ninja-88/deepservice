@@ -1,31 +1,7 @@
 """
-=============================================================================
-DeepService 对话管理 — 对话状态跟踪 (Dialogue State Tracker)
-=============================================================================
-职责：
-  1. 有限状态机（FSM）管理对话流程 — 结构化业务流程
-  2. 槽位填充（Slot Filling）— 逐步收集业务所需信息
-  3. 多轮信息确认 — 退换货/投诉等需要多步确认的场景
-
-企业级设计原则：
-  - FSM 管理需要结构化信息收集的业务流程（退换货、工单提交）
-  - 槽位机制确保信息完整（避免遗漏退货原因、照片等关键信息）
-  - 状态可持久化（Redis）保证服务重启不丢失进行中的流程
-  - 自由对话与结构化流程可切换（大部分时间是自由对话）
-
-对话状态机示例（退换货流程）：
-  ┌─────────┐   确认意图   ┌──────────┐   收集订单号  ┌──────────┐
-  │  IDLE   │────────────→│CONFIRMING│────────────→│SLOT_FILL │
-  └─────────┘             └──────────┘             └─────┬────┘
-       ↑                                                  │
-       │                                  收集退货原因     │
-       │              ┌──────────┐       收集照片         │
-       └──────────────│COMPLETED │←───────────────────────┘
-                      └──────────┘  槽位已满 / 用户确认
-
-参考：
-  [reference:4] — 意图识别-对话管理-回复生成三段式架构
-=============================================================================
+Dialogue State Tracker — FSM + slot filling for structured business flows.
+FSM switches from free-form chat into guided flows (returns, complaints).
+State persists to Redis so in-progress flows survive restarts.
 """
 
 import time
@@ -40,64 +16,49 @@ from loguru import logger
 from config import get_config
 
 
-# ============================================================================
-# 状态机核心定义
-# ============================================================================
+# <<< FSM core definitions
 class DialogueState(str, Enum):
     """
-    对话状态枚举
-
-    状态分为两层：
-      - 全局状态：对话的整体状态（自由对话 / 结构化流程中）
-      - 流程状态：具体业务流程的步骤（退换货的第几步）
+    Dialogue states: top-level (free chat vs structured flow) and step-level within a flow.
     """
-    # 全局状态
-    IDLE = "idle"                       # 空闲，等待用户输入
-    FREE_CHAT = "free_chat"             # 自由对话模式（常规问答）
-    STRUCTURED_FLOW = "structured"      # 结构化流程中（退换货、工单等）
-    CLARIFYING = "clarifying"           # 澄清中（需要用户补充信息）
-    CONFIRMING = "confirming"           # 确认中（等待用户确认信息）
-    WAITING_USER = "waiting_user"       # 等待用户操作
-    HANDOFF = "handoff"                 # 转人工中
-    TERMINATED = "terminated"           # 已结束
+    IDLE = "idle"                       # waiting for user input
+    FREE_CHAT = "free_chat"             # open-ended Q&A
+    STRUCTURED_FLOW = "structured"      # inside a guided flow
+    CLARIFYING = "clarifying"           # asking user for more info
+    CONFIRMING = "confirming"           # waiting for user to confirm
+    WAITING_USER = "waiting_user"       # waiting for user action
+    HANDOFF = "handoff"                 # transferring to human
+    TERMINATED = "terminated"           # ended
 
 
 class FlowType(str, Enum):
-    """业务流程类型"""
-    RETURN_EXCHANGE = "return_exchange"     # 退换货流程
-    COMPLAINT = "complaint"                 # 投诉流程
-    ORDER_LOOKUP = "order_lookup"           # 订单查询（需验证身份）
-    FEEDBACK = "feedback"                   # 反馈建议收集
-    ACCOUNT_RECOVERY = "account_recovery"   # 账号找回
+    """Supported business flow types"""
+    RETURN_EXCHANGE = "return_exchange"     # return / exchange flow
+    COMPLAINT = "complaint"                 # complaint flow
+    ORDER_LOOKUP = "order_lookup"           # order lookup (requires identity verification)
+    FEEDBACK = "feedback"                   # feedback collection
+    ACCOUNT_RECOVERY = "account_recovery"   # account recovery
 
 
-# ============================================================================
-# 槽位定义
-# ============================================================================
+# <<< Slot definitions
 @dataclass
 class Slot:
     """
-    槽位 — 业务流程中的一个信息字段
-
-    属性：
-      - required: 是否必填
-      - prompt: 向用户询问该信息的问题模板
-      - validate: 验证函数（返回 None=通过，返回 str=错误提示）
-      - value: 当前填充值
-      - filled: 是否已填充
+    A single information field within a business flow.
+    required, prompt, validate_func, and optional value/filled tracking.
     """
-    name: str                           # 槽位名称
-    description: str                    # 描述
-    prompt: str                         # 询问用户的提示语
+    name: str
+    description: str
+    prompt: str                         # question to ask the user
     required: bool = True
     value: Any = None
     filled: bool = False
     validate_func: Optional[Callable[[Any], Optional[str]]] = None
-    attempts: int = 0                   # 已尝试询问次数
-    max_attempts: int = 3               # 最大询问次数
+    attempts: int = 0                   # times already asked
+    max_attempts: int = 3               # max times before escalating
 
     def validate(self) -> Optional[str]:
-        """验证当前值，返回错误信息或 None（通过）"""
+        """Validate current value; returns error string or None if OK"""
         if self.required and (self.value is None or self.value == ""):
             return f"请提供{self.description}"
 
@@ -153,7 +114,7 @@ class SlotCollection:
         return None
 
     def fill_slot(self, name: str, value: Any) -> bool:
-        """填充指定槽位"""
+        """Fill a slot by name; returns False if validation fails"""
         for slot in self.slots:
             if slot.name == name:
                 slot.value = value
@@ -162,7 +123,7 @@ class SlotCollection:
                     slot.attempts += 1
                     return False
                 slot.filled = True
-                logger.info(f"[SlotCollection] 槽位 {name} 已填充: {value}")
+                logger.info(f"[SlotCollection] Slot '{name}' filled: {value}")
                 return True
         return False
 
@@ -175,24 +136,22 @@ class SlotCollection:
         }
 
     def to_summary(self) -> str:
-        """生成槽位填充状态摘要"""
+        """Return a human-readable slot-filling progress summary"""
         parts = []
         for slot in self.slots:
             status = "✓" if slot.filled else "○"
-            value_str = str(slot.value) if slot.value else "(待填写)"
+            value_str = str(slot.value) if slot.value else "(pending)"
             parts.append(f"  {status} {slot.description}: {value_str}")
         return "\n".join(parts)
 
 
-# ============================================================================
-# 流程定义
-# ============================================================================
+# <<< Flow definitions
 class FlowDefinition:
-    """业务流程定义"""
+    """Pre-built slot collections for each flow type"""
 
     @staticmethod
     def return_exchange_flow() -> SlotCollection:
-        """退换货流程槽位定义"""
+        """Return/exchange flow slots"""
         return SlotCollection(slots=[
             Slot(
                 name="order_id",
@@ -235,7 +194,7 @@ class FlowDefinition:
 
     @staticmethod
     def complaint_flow() -> SlotCollection:
-        """投诉流程槽位定义"""
+        """Complaint flow slots"""
         return SlotCollection(slots=[
             Slot(
                 name="complaint_type",
@@ -269,7 +228,7 @@ class FlowDefinition:
 
     @staticmethod
     def get_flow(flow_type: FlowType) -> Optional[SlotCollection]:
-        """按类型获取流程定义"""
+        """Look up flow definition by type"""
         flows = {
             FlowType.RETURN_EXCHANGE: FlowDefinition.return_exchange_flow,
             FlowType.COMPLAINT: FlowDefinition.complaint_flow,
@@ -278,12 +237,10 @@ class FlowDefinition:
         return factory() if factory else None
 
 
-# ============================================================================
-# 有限状态机 (FSM)
-# ============================================================================
+# <<< Finite state machine
 @dataclass
 class StateMachineContext:
-    """状态机上下文 — 保存在会话中"""
+    """FSM context persisted per session"""
     current_state: DialogueState = DialogueState.IDLE
     current_flow: Optional[FlowType] = None
     slots: Optional[SlotCollection] = None
@@ -294,18 +251,12 @@ class StateMachineContext:
 
 class DialogueStateMachine:
     """
-    有限状态机 — 管理对话流程的状态转移
-
-    状态转移规则：
-      IDLE → FREE_CHAT（用户开始对话）
-      FREE_CHAT → STRUCTURED_FLOW（触发结构化流程）
-      STRUCTURED_FLOW → CONFIRMING（收集完信息，等待确认）
-      CONFIRMING → COMPLETED（用户确认）
-      任意状态 → HANDOFF（触发转人工）
-      任意状态 → TERMINATED（用户主动结束）
+    FSM that governs dialogue state transitions.
+    Key transitions: IDLE->FREE_CHAT->STRUCTURED_FLOW->CONFIRMING->FREE_CHAT.
+    Any state can reach HANDOFF or TERMINATED.
     """
 
-    # 状态转移表
+    # Transition table
     TRANSITIONS: Dict[DialogueState, Set[DialogueState]] = {
         DialogueState.IDLE: {
             DialogueState.FREE_CHAT,
@@ -313,31 +264,31 @@ class DialogueStateMachine:
             DialogueState.TERMINATED,
         },
         DialogueState.FREE_CHAT: {
-            DialogueState.FREE_CHAT,         # 持续自由对话
-            DialogueState.STRUCTURED_FLOW,   # 触发结构化流程
-            DialogueState.CLARIFYING,         # 需要澄清
-            DialogueState.CONFIRMING,         # 需要确认
-            DialogueState.WAITING_USER,       # 等待用户操作
-            DialogueState.HANDOFF,            # 转人工
-            DialogueState.TERMINATED,         # 结束
+            DialogueState.FREE_CHAT,         # continue free chat
+            DialogueState.STRUCTURED_FLOW,   # trigger structured flow
+            DialogueState.CLARIFYING,         # need clarification
+            DialogueState.CONFIRMING,         # need confirmation
+            DialogueState.WAITING_USER,       # wait for user action
+            DialogueState.HANDOFF,            # transfer to human
+            DialogueState.TERMINATED,         # end
         },
         DialogueState.STRUCTURED_FLOW: {
-            DialogueState.STRUCTURED_FLOW,   # 持续收集信息
-            DialogueState.CLARIFYING,         # 需要澄清槽位
-            DialogueState.CONFIRMING,         # 槽位填满，确认
-            DialogueState.WAITING_USER,       # 等待用户（如上传照片）
-            DialogueState.HANDOFF,            # 转人工
-            DialogueState.FREE_CHAT,          # 用户取消流程
+            DialogueState.STRUCTURED_FLOW,   # continue collecting info
+            DialogueState.CLARIFYING,         # clarify a slot
+            DialogueState.CONFIRMING,         # slots full, confirm
+            DialogueState.WAITING_USER,       # wait for user (e.g. photo upload)
+            DialogueState.HANDOFF,            # transfer to human
+            DialogueState.FREE_CHAT,          # user cancelled flow
         },
         DialogueState.CLARIFYING: {
-            DialogueState.STRUCTURED_FLOW,   # 澄清后回到流程
-            DialogueState.FREE_CHAT,          # 澄清后自由对话
-            DialogueState.CONFIRMING,         # 澄清后确认
+            DialogueState.STRUCTURED_FLOW,   # back to flow after clarification
+            DialogueState.FREE_CHAT,          # back to free chat
+            DialogueState.CONFIRMING,         # confirm after clarification
         },
         DialogueState.CONFIRMING: {
-            DialogueState.FREE_CHAT,          # 确认完成
-            DialogueState.STRUCTURED_FLOW,   # 用户要修改信息
-            DialogueState.WAITING_USER,       # 等待用户确认
+            DialogueState.FREE_CHAT,          # confirmation done
+            DialogueState.STRUCTURED_FLOW,   # user wants to modify info
+            DialogueState.WAITING_USER,       # waiting for user confirmation
         },
         DialogueState.WAITING_USER: {
             DialogueState.FREE_CHAT,
@@ -346,18 +297,18 @@ class DialogueStateMachine:
             DialogueState.TERMINATED,
         },
         DialogueState.HANDOFF: {
-            DialogueState.FREE_CHAT,          # 转接中用户继续聊天
-            DialogueState.TERMINATED,         # 转接完成
+            DialogueState.FREE_CHAT,          # user continues chatting during transfer
+            DialogueState.TERMINATED,         # transfer complete
         },
-        DialogueState.TERMINATED: set(),      # 终态
+        DialogueState.TERMINATED: set(),      # terminal state
     }
 
     def __init__(self):
         self._contexts: Dict[str, StateMachineContext] = {}
-        logger.info("[DialogueStateMachine] FSM 初始化完成")
+        logger.info("[DialogueStateMachine] FSM initialized")
 
     def get_context(self, session_id: str) -> StateMachineContext:
-        """获取或创建状态机上下文"""
+        """Get or create FSM context for a session"""
         if session_id not in self._contexts:
             self._contexts[session_id] = StateMachineContext()
         return self._contexts[session_id]
@@ -369,100 +320,92 @@ class DialogueStateMachine:
         flow_type: Optional[FlowType] = None,
     ) -> Tuple[bool, str]:
         """
-        执行状态转移
-
-        返回: (是否成功, 消息)
+        Execute a state transition. Returns (success, message).
         """
         ctx = self.get_context(session_id)
         current = ctx.current_state
 
-        # 验证转移合法性
+        # Validate transition is allowed
         allowed = self.TRANSITIONS.get(current, set())
         if target_state not in allowed and current != target_state:
-            return False, f"不允许从 {current.value} 转移到 {target_state.value}"
+            return False, f"Transition forbidden: {current.value} -> {target_state.value}"
 
-        # 记录历史
+        # Record history
         ctx.state_history.append(current)
         ctx.current_state = target_state
         ctx.entered_at = time.time()
 
-        # 进入结构化流程时初始化槽位
+        # Initialize slots when entering structured flow
         if target_state == DialogueState.STRUCTURED_FLOW and flow_type:
             ctx.current_flow = flow_type
             ctx.slots = FlowDefinition.get_flow(flow_type)
 
-        # 退出结构化流程时清理
+        # Keep slot data on exit (don't clear here)
         if current == DialogueState.STRUCTURED_FLOW and target_state != DialogueState.STRUCTURED_FLOW:
-            pass  # 保留槽位数据用于后续，不在转移时清理
+            pass
 
         logger.info(
-            f"[FSM] 状态转移: {session_id[:12]}... "
-            f"{current.value} → {target_state.value}"
+            f"[FSM] Transition: {session_id[:12]}... "
+            f"{current.value} -> {target_state.value}"
         )
-        return True, f"状态转移成功: {current.value} → {target_state.value}"
+        return True, f"Transition ok: {current.value} -> {target_state.value}"
 
     def get_current_state(self, session_id: str) -> DialogueState:
-        """获取当前状态"""
+        """Return current FSM state"""
         return self.get_context(session_id).current_state
 
     def is_in_structured_flow(self, session_id: str) -> bool:
-        """是否在结构化流程中"""
+        """True if the session is inside a structured flow"""
         ctx = self.get_context(session_id)
         return (ctx.current_state == DialogueState.STRUCTURED_FLOW and
                 ctx.slots is not None)
 
     def fill_current_slot(self, session_id: str, value: Any) -> Tuple[bool, str, Optional[str]]:
         """
-        尝试填充当前槽位
-
-        返回: (是否成功, 提示消息, 下一个要询问的槽位名称)
+        Try to fill the current slot. Returns (success, prompt_msg, next_slot_name).
         """
         ctx = self.get_context(session_id)
 
         if not ctx.slots:
-            return False, "当前无活跃的槽位集合", None
+            return False, "No active slot collection", None
 
         next_slot = ctx.slots.next_unfilled
         if not next_slot:
-            return True, "所有必填信息已收集完毕", None
+            return True, "All required fields collected", None
 
-        # 尝试填充
+        # Try filling
         success = ctx.slots.fill_slot(next_slot.name, value)
         if success:
             next_unfilled = ctx.slots.next_unfilled
             if next_unfilled:
                 return True, next_unfilled.prompt, next_unfilled.name
             else:
-                return True, "信息收集完成，请确认", None
+                return True, "All info collected, please confirm", None
         else:
             next_slot.attempts += 1
             if next_slot.attempts >= next_slot.max_attempts:
                 return False, (
-                    f"已尝试{next_slot.max_attempts}次仍未获取有效信息。"
-                    "将为您转接人工客服。"
+                    f"{next_slot.max_attempts} attempts without valid input. "
+                    "Transferring to human agent."
                 ), None
             return False, next_slot.prompt, next_slot.name
 
     def reset(self, session_id: str):
-        """重置状态机"""
+        """Reset FSM context for a session"""
         if session_id in self._contexts:
             del self._contexts[session_id]
-        logger.debug(f"[FSM] 状态机已重置: {session_id[:12]}...")
+        logger.debug(f"[FSM] Reset: {session_id[:12]}...")
 
 
-# ============================================================================
-# 对话状态跟踪器（统一接口）
-# ============================================================================
+# <<< Dialogue state tracker (public API)
 class DialogueStateTracker:
     """
-    对话状态跟踪器 — 对外统一接口
-
-    整合了 FSM + Slot Filling，提供简洁的业务 API。
+    Public API that integrates FSM + slot filling.
     """
 
     def __init__(self):
         self.fsm = DialogueStateMachine()
-        logger.info("[DialogueStateTracker] 初始化完成")
+        logger.info("[DialogueStateTracker] Initialized")
 
     def start_flow(
         self,
@@ -470,10 +413,7 @@ class DialogueStateTracker:
         flow_type: FlowType,
     ) -> Dict:
         """
-        启动一个结构化业务流程
-
-        返回流程的第一个提示。
-        示例用途：用户说"我要退货" → 启动退换货流程
+        Start a structured flow. Returns the first prompt, e.g. "我要退货" -> return flow.
         """
         success, msg = self.fsm.transition(
             session_id,
@@ -503,14 +443,12 @@ class DialogueStateTracker:
         user_input: str,
     ) -> Dict:
         """
-        处理用户输入（在结构化流程中）
-
-        根据当前状态和槽位状态，决定下一步动作。
+        Handle user input during a structured flow (slot filling, confirmation, etc.).
         """
         ctx = self.fsm.get_context(session_id)
         state = ctx.current_state
 
-        # 非结构化流程中的输入 → 自由对话
+        # Input outside structured flow -> free chat
         if state != DialogueState.STRUCTURED_FLOW:
             return {
                 "status": "free_chat",
@@ -518,7 +456,7 @@ class DialogueStateTracker:
                 "message": None,
             }
 
-        # 检查是否要取消/退出流程
+        # Check for cancel/exit signals
         cancel_signals = ["取消", "算了", "不用了", "不退了", "不想", "退出", "返回"]
         if any(sig in user_input for sig in cancel_signals):
             self.fsm.transition(session_id, DialogueState.FREE_CHAT)
@@ -527,10 +465,10 @@ class DialogueStateTracker:
                 "message": "好的，已取消当前流程。请问还有什么可以帮您的？",
             }
 
-        # 尝试填充槽位
+        # Try filling the current slot
         success, prompt, next_slot = self.fsm.fill_current_slot(session_id, user_input)
 
-        # 检查是否所有槽位已填满
+        # Check if all required slots are filled
         if success and ctx.slots and ctx.slots.all_filled:
             if ctx.current_state != DialogueState.CONFIRMING:
                 self.fsm.transition(session_id, DialogueState.CONFIRMING)
@@ -541,11 +479,11 @@ class DialogueStateTracker:
                 "all_filled": True,
             }
 
-        # 用户确认
+        # User confirmation phase
         if ctx.current_state == DialogueState.CONFIRMING:
             confirm_signals = ["确认", "是", "对的", "正确", "yes", "ok", "没问题", "可以"]
             if any(sig in user_input.lower() for sig in confirm_signals):
-                # 完成流程
+                # Flow complete
                 flow_data = {
                     "flow_type": ctx.current_flow.value if ctx.current_flow else "unknown",
                     "slots": ctx.slots.to_dict() if ctx.slots else {},
@@ -560,7 +498,7 @@ class DialogueStateTracker:
 
             modify_signals = ["修改", "改", "不对", "错了", "no"]
             if any(sig in user_input.lower() for sig in modify_signals):
-                # 重置确认槽位，回到收集状态
+                # Reset confirmation slot, go back to collecting
                 self.fsm.transition(session_id, DialogueState.STRUCTURED_FLOW)
                 ctx.slots.current_slot_index = 0
                 for slot in ctx.slots.slots:
@@ -572,13 +510,13 @@ class DialogueStateTracker:
                     "message": f"请重新输入。{next_unfilled.prompt if next_unfilled else ''}",
                 }
 
-            # 未识别的确认回复
+            # Unrecognized confirmation reply
             return {
                 "status": "awaiting_confirmation",
                 "message": "请回复'确认'提交，或回复'修改'调整信息。",
             }
 
-        # 填充结果处理
+        # Handle fill result
         if success:
             return {
                 "status": "slot_filled",
@@ -587,13 +525,13 @@ class DialogueStateTracker:
                 "progress": self._get_progress(ctx),
             }
         else:
-            # 填充失败（验证不通过或次数用尽）
+            # Fill failed (validation error or max attempts)
             if next_slot is None:
-                # 次数用尽，转人工
+                # Max attempts exceeded -> transfer to human
                 self.fsm.transition(session_id, DialogueState.HANDOFF)
                 return {
                     "status": "flow_failed",
-                    "message": prompt,  # 转人工提示
+                    "message": prompt,
                     "transfer_human": True,
                 }
             return {
@@ -603,7 +541,7 @@ class DialogueStateTracker:
             }
 
     def get_status(self, session_id: str) -> Dict:
-        """获取当前对话状态摘要"""
+        """Return current dialogue state summary"""
         ctx = self.fsm.get_context(session_id)
         result = {
             "session_id": session_id,
@@ -615,18 +553,18 @@ class DialogueStateTracker:
         return result
 
     def reset(self, session_id: str):
-        """重置对话状态"""
+        """Reset dialogue state for a session"""
         self.fsm.reset(session_id)
 
     def _build_confirmation_message(self, ctx: StateMachineContext) -> str:
-        """构建确认信息"""
+        """Build the confirmation summary for the user"""
         if not ctx.slots:
             return "请确认以上信息。"
         summary = ctx.slots.to_summary()
         return f"请确认以下信息：\n\n{summary}\n\n回复'确认'提交，或回复'修改'调整。"
 
     def _get_progress(self, ctx: StateMachineContext) -> float:
-        """计算当前流程进度（0-1）"""
+        """Compute flow completion ratio (0-1)"""
         if not ctx.slots:
             return 0.0
         total_required = sum(1 for s in ctx.slots.slots if s.required)
@@ -634,67 +572,45 @@ class DialogueStateTracker:
         return filled_required / total_required if total_required > 0 else 0.0
 
 
-# ============================================================================
-# 全局单例
-# ============================================================================
-import threading
-
 _tracker: Optional[DialogueStateTracker] = None
-_tracker_lock = threading.Lock()
 
 
 def get_dialogue_state_tracker() -> DialogueStateTracker:
     global _tracker
     if _tracker is None:
-        with _tracker_lock:
-            if _tracker is None:
-                _tracker = DialogueStateTracker()
+        _tracker = DialogueStateTracker()
     return _tracker
 
 
-# ============================================================================
-# 独立测试
-# ============================================================================
+# <<< Self-check
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("DeepService Dialogue State Tracker — 独立测试")
-    logger.info("=" * 60)
-
+    logger.info("Dialogue State self-check")
     tracker = DialogueStateTracker()
     session_id = "test_fsm_001"
 
-    # 测试1：启动退换货流程
-    logger.info("\n[测试1] 启动退换货流程")
+    # 1. Start return flow
     result = tracker.start_flow(session_id, FlowType.RETURN_EXCHANGE)
-    logger.info(f"  状态: {result['status']}")
-    logger.info(f"  提示: {result['message']}")
+    logger.info(f"  Start flow: {result['status']}")
 
-    # 测试2：逐步填充槽位
+    # 2. Step through slots
     test_inputs = [
-        "#20240001",              # 订单号
-        "质量问题",                # 退货原因
-        "有照片",                  # 是否有照片
-        "衣服有明显的色差和线头",    # 问题描述
-        "确认",                    # 确认
+        "#20240001",
+        "质量问题",
+        "有照片",
+        "衣服有明显的色差和线头",
+        "确认",
     ]
-
     for i, user_input in enumerate(test_inputs):
-        logger.info(f"\n[测试2-{i+1}] 用户输入: '{user_input}'")
         result = tracker.process_user_input(session_id, user_input)
-        logger.info(f"  状态: {result['status']}")
-        logger.info(f"  回复: {result.get('message', 'N/A')[:100]}")
+        logger.info(f"  Step {i+1}: {result['status']}")
 
-    # 测试3：获取当前状态
-    logger.info("\n[测试3] 当前状态")
+    # 3. Get status
     status = tracker.get_status(session_id)
-    logger.info(f"  {json.dumps(status, ensure_ascii=False, indent=2)}")
+    logger.info(f"  State: {status['state']}")
 
-    # 测试4：取消流程
-    logger.info("\n[测试4] 取消流程")
+    # 4. Cancel flow
     tracker.start_flow(session_id, FlowType.RETURN_EXCHANGE)
     result = tracker.process_user_input(session_id, "算了不退了")
-    logger.info(f"  状态: {result['status']}")
-    logger.info(f"  回复: {result.get('message', 'N/A')}")
+    logger.info(f"  Cancel: {result['status']}")
 
-    logger.info("=" * 60)
-    logger.info("对话状态跟踪测试完成 ✓")
+    logger.info("Dialogue state self-check complete.")

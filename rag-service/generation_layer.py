@@ -1,29 +1,10 @@
-"""
-=============================================================================
-DeepService RAG — RAG 生成模块 (Generation Layer)
-=============================================================================
-职责：
-  1. Prompt 模板设计（含严格的输出约束）
-  2. 源引用标注（回答可追溯到具体知识来源）
-  3. 拒答规则（检索相关度低时触发拒答）
-  4. 流式输出（SSE 打字机效果）
-
-企业级设计原则：
-  - Prompt 是 LLM 应用的"源代码"，需版本化管理
-  - 输出约束防止模型自由发挥导致幻觉
-  - 引用来源是建立用户信任的关键
-  - 流式输出提升感知性能
-
-参考：
-  [reference:2] — 解决幻觉需要知识边界控制和输出约束等机制
-=============================================================================
-"""
+"""RAG generation — prompt templates, citation extraction, streaming, and response classification."""
 
 import json
 import re
 import time
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, AsyncGenerator, Generator, Tuple
+from typing import List, Dict, Optional, Generator, Tuple
 from enum import Enum
 
 from openai import OpenAI
@@ -33,44 +14,42 @@ from config import get_config
 from retrieval_layer import SearchResult, RetrievalResult
 
 
-# ============================================================================
-# 数据结构
-# ============================================================================
+# /// Data structures
 class ResponseType(str, Enum):
-    """回答类型"""
-    KNOWLEDGE_BASED = "knowledge_based"       # 基于知识库回答
-    UNCERTAIN = "uncertain"                    # 无法确定
-    CLARIFICATION = "clarification"            # 需要澄清
-    HANDOFF = "handoff"                        # 建议转人工
-    GREETING = "greeting"                      # 寒暄
-    CHITCHAT = "chitchat"                      # 闲聊
+    """Response classification enum."""
+    KNOWLEDGE_BASED = "knowledge_based"       # knowledge-base answer
+    UNCERTAIN = "uncertain"                    # cannot determine
+    CLARIFICATION = "clarification"            # needs clarification
+    HANDOFF = "handoff"                        # suggest human handoff
+    GREETING = "greeting"                      # greeting
+    CHITCHAT = "chitchat"                      # casual chat
 
 
 @dataclass
 class TokenStream:
-    """流式 Token"""
+    """Single streaming token chunk."""
     content: str
     finish_reason: Optional[str] = None
 
 
 @dataclass
 class Citation:
-    """来源引用"""
-    index: int                                # 引用编号 [来源: 1]
-    document_title: str                       # 文档标题
-    content_snippet: str                      # 引用内容摘要
-    relevance_score: float                    # 相关性得分
+    """A cited source extracted from the generated response."""
+    index: int                                # citation number [source: 1]
+    document_title: str                       # document title
+    content_snippet: str                      # cited content snippet
+    relevance_score: float                    # relevance score
 
 
 @dataclass
 class RAGResponse:
-    """RAG 生成的完整响应"""
-    content: str                              # 回答正文
-    response_type: ResponseType               # 回答类型
+    """Full RAG response including content, type, citations, and metadata."""
+    content: str                              # answer body
+    response_type: ResponseType               # response classification
     citations: List[Citation] = field(default_factory=list)
-    confidence: float = 0.0                   # 置信度 (0-1)
+    confidence: float = 0.0                   # confidence score (0-1)
     metadata: Dict = field(default_factory=dict)
-    usage: Dict = field(default_factory=dict)  # token 使用量
+    usage: Dict = field(default_factory=dict)  # token usage
 
     def to_dict(self) -> Dict:
         return {
@@ -83,7 +62,7 @@ class RAGResponse:
         }
 
     def to_markdown_with_citations(self) -> str:
-        """生成带来源标注的 Markdown 回答（展示用）"""
+        """Render the response as Markdown with source citations."""
         md = self.content
         if self.citations:
             md += "\n\n---\n**参考来源：**\n"
@@ -96,23 +75,15 @@ class RAGResponse:
         return md
 
 
-# ============================================================================
-# Prompt 模板管理
-# ============================================================================
+# /// Prompt template management
 class PromptTemplates:
     """
-    Prompt 模板库 — LLM 应用的"源代码"
+    Prompt template library — the "source code" for LLM responses.
 
-    版本化管理，可在管理后台动态切换。
-    每个模板包含：系统提示词、用户消息模板、输出约束。
-
-    设计要点：
-      - 角色设定 + 行为约束 + 输出格式 = 三层结构
-      - 使用少数示例（Few-shot）锚定输出格式
-      - 输出约束用 <指令> 标签明确标注
+    Versioned templates with system prompts, user message templates, and output constraints.
     """
 
-    # === System Prompt（系统提示词）===
+    # === System prompts ===
     SYSTEM_PROMPT_RAG = """你是一个专业的企业智能客服助手，名为"DeepService"。
 
 <核心规则>
@@ -153,7 +124,7 @@ class PromptTemplates:
 4. 涉及系统权限、密码重置等敏感操作，必须转接人工坐席。
 </核心规则>"""
 
-    # === User Message 模板 ===
+    # === User message templates ===
     USER_MESSAGE_WITH_CONTEXT = """<用户问题>
 {user_query}
 </用户问题>
@@ -183,7 +154,7 @@ class PromptTemplates:
 
 请结合对话历史和参考知识回答。如果在对话历史中提到过相关信息，请关联上下文。"""
 
-    # === 意图分类 Prompt ===
+    # === Intent classification prompt ===
     INTENT_CLASSIFICATION_PROMPT = """请将以下用户消息分类到对应的意图类别。
 
 用户消息："{user_query}"
@@ -203,16 +174,16 @@ class PromptTemplates:
 {{"intent": "类别", "confidence": 0.95, "reason": "简短分类理由"}}
 ```"""
 
-    # === 拒答模板 ===
+    # === Uncertain response template ===
     UNCERTAIN_RESPONSE_TEMPLATE = (
         "根据我目前的知识库，无法为您确认这个问题的答案。"
         "我建议您：\n"
         "1. 换个方式重新描述您的问题\n"
-        "2. 联系人工客服获取更准确的帮助（回复"人工"即可转接）\n"
+        '2. 联系人工客服获取更准确的帮助（回复"人工"即可转接）\n'
         "3. 查看我们的帮助中心获取更多信息"
     )
 
-    # === 澄清追问模板 ===
+    # === Clarification template ===
     CLARIFICATION_TEMPLATE = (
         "为了更好地帮助您，我需要确认一下：\n{clarification_questions}\n"
         "请提供更多信息，我会为您更准确地解答。"
@@ -220,7 +191,7 @@ class PromptTemplates:
 
     @classmethod
     def get_system_prompt(cls, scenario: str = "general") -> str:
-        """按场景获取系统提示词"""
+        """Return the system prompt for the given scenario."""
         prompts = {
             "general": cls.SYSTEM_PROMPT_RAG,
             "sales": cls.SYSTEM_PROMPT_RAG_SALES,
@@ -237,19 +208,7 @@ class PromptTemplates:
         recent_messages: Optional[str] = None,
         scenario: str = "general",
     ) -> List[Dict[str, str]]:
-        """
-        构建完整的 RAG 消息列表
-
-        参数:
-          user_query: 用户当前问题
-          retrieved_context: 检索到的参考知识（已格式化）
-          conversation_history: 对话摘要（长期记忆）
-          recent_messages: 最近消息文本（短期记忆）
-          scenario: 场景标识
-
-        返回:
-          OpenAI 格式的 messages 列表
-        """
+        """Build a complete messages list for the RAG call (system + user)."""
         system_prompt = cls.get_system_prompt(scenario)
 
         if conversation_history or recent_messages:
@@ -271,33 +230,15 @@ class PromptTemplates:
         ]
 
 
-# ============================================================================
-# DeepSeek API 客户端封装
-# ============================================================================
+# /// DeepSeek API client wrapper
 class DeepSeekClient:
-    """
-    DeepSeek API 客户端
-
-    封装了 OpenAI 兼容接口，提供：
-      - 同步/流式调用
-      - Token 计数
-      - 自动重试
-      - 结构化输出日志
-    """
+    """OpenAI-compatible client for DeepSeek with sync/stream support."""
 
     def __init__(self):
-        from config import get_api_key
+        from config import get_llm_client
         config = get_config().llm
-        api_key = get_api_key()
-        if not api_key:
-            raise ValueError(
-                "DEEPSEEK_API_KEY 未设置。请在 .env 文件或环境变量中配置。\n"
-                "获取方式: https://platform.deepseek.com/api_keys"
-            )
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=config.base_url,
-        )
+        self.client = get_llm_client()
+        self._available = self.client is not None
         self.chat_model = config.chat_model
         self.max_output_tokens = config.max_output_tokens
 
@@ -308,11 +249,14 @@ class DeepSeekClient:
         max_tokens: Optional[int] = None,
         stream: bool = False,
     ) -> Dict:
-        """
-        同步对话调用
-
-        返回: {content, usage, finish_reason, model}
-        """
+        """Synchronous chat call. Returns {content, usage, finish_reason, model}."""
+        if not self._available:
+            return {
+                "content": "LLM service is not configured. Please set DEEPSEEK_API_KEY.",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "finish_reason": "error",
+                "model": "unavailable",
+            }
         max_tokens = max_tokens or self.max_output_tokens
 
         try:
@@ -337,7 +281,7 @@ class DeepSeekClient:
             }
 
         except Exception as e:
-            logger.error(f"[DeepSeekClient] API 调用失败: {e}")
+            logger.error(f"[DeepSeekClient] API call failed: {e}")
             raise
 
     def chat_stream(
@@ -346,16 +290,12 @@ class DeepSeekClient:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
     ) -> Generator[TokenStream, None, Dict]:
-        """
-        流式对话调用
+        """Streaming chat call using a Generator that yields one token at a time."""
+        if not self._available:
+            yield TokenStream(content="LLM service is not configured. Please set DEEPSEEK_API_KEY.")
+            yield TokenStream(content="", finish_reason="error")
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        使用 Generator 模式，逐步 yield 每个 token。
-
-        用法:
-            client = DeepSeekClient()
-            for token in client.chat_stream(messages):
-                print(token.content, end="", flush=True)
-        """
         max_tokens = max_tokens or self.max_output_tokens
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -378,7 +318,7 @@ class DeepSeekClient:
                     )
 
                 if chunk.choices and chunk.choices[0].finish_reason:
-                    # 记录 usage（在最后一个 chunk 中）
+                    # Record usage (on final chunk)
                     if hasattr(chunk, "usage") and chunk.usage:
                         usage = {
                             "prompt_tokens": chunk.usage.prompt_tokens or 0,
@@ -391,30 +331,18 @@ class DeepSeekClient:
                     )
 
         except Exception as e:
-            logger.error(f"[DeepSeekClient] 流式调用失败: {e}")
+            logger.error(f"[DeepSeekClient] Stream call failed: {e}")
             raise
 
         return usage
 
 
-# ============================================================================
-# RAG 生成引擎
-# ============================================================================
+# /// RAG generation engine
 class RAGGenerator:
     """
-    RAG 生成引擎 — 将检索结果转化为最终回答
+    RAG generation engine — transforms retrieval results into a final answer.
 
-    核心流程：
-      1. 构建检索上下文（格式化来源内容）
-      2. 组装 Prompt + 检索结果
-      3. 调用 DeepSeek 生成回答
-      4. 解析来源引用
-      5. 判断是否需要拒答
-
-    输出约束策略：
-      - System Prompt 明确"只能基于参考知识回答"
-      - User Message 格式化的上下文注入
-      - 后处理检查是否有来源标注
+    Pipeline: build context -> assemble prompt + results -> call LLM -> parse citations -> classify response.
     """
 
     def __init__(self, scenario: str = "general"):
@@ -430,28 +358,16 @@ class RAGGenerator:
         recent_messages: Optional[str] = None,
         stream: bool = False,
     ) -> RAGResponse:
-        """
-        生成 RAG 回答
-
-        参数:
-          user_query: 用户问题
-          search_result: 检索结果
-          conversation_summary: 对话摘要
-          recent_messages: 最近消息
-          stream: 是否流式输出
-
-        返回:
-          RAGResponse
-        """
+        """Generate a RAG response from user query and search results."""
         logger.info(
-            f"[RAGGenerator] 生成回答: query='{user_query[:50]}...', "
+            f"[RAGGenerator] generating: query='{user_query[:50]}...', "
             f"retrieved={search_result.result_count} chunks, "
             f"top_similarity={search_result.top_similarity:.3f}"
         )
 
-        # Step 1: 知识边界预检
+        # Step 1: knowledge boundary pre-check
         if not search_result.is_reliable:
-            logger.info(f"[RAGGenerator] 检索结果不可靠，触发拒答")
+            logger.info(f"[RAGGenerator] unreliable retrieval, triggering fallback")
             return RAGResponse(
                 content=PromptTemplates.UNCERTAIN_RESPONSE_TEMPLATE,
                 response_type=ResponseType.UNCERTAIN,
@@ -462,10 +378,10 @@ class RAGGenerator:
                 },
             )
 
-        # Step 2: 构建检索上下文
+        # Step 2: build retrieval context
         retrieved_context = self._build_context(search_result)
 
-        # Step 3: 构建消息
+        # Step 3: build messages
         messages = PromptTemplates.build_rag_messages(
             user_query=user_query,
             retrieved_context=retrieved_context,
@@ -474,15 +390,15 @@ class RAGGenerator:
             scenario=self.scenario,
         )
 
-        # Step 4: 调用 LLM 生成
+        # Step 4: call LLM
         if stream:
-            # 流式模式：返回生成器和元数据，由上层处理
+            # Stream mode: return generator + metadata, handled by caller
             return self._generate_stream(messages, search_result, user_query)
         else:
             return self._generate_sync(messages, search_result, user_query)
 
     def _build_context(self, search_result: SearchResult) -> str:
-        """构建检索上下文文本"""
+        """Format retrieved results into a context string for the prompt."""
         if not search_result.results:
             return "（未找到相关参考知识）"
 
@@ -498,25 +414,25 @@ class RAGGenerator:
         search_result: SearchResult,
         user_query: str,
     ) -> RAGResponse:
-        """同步生成"""
+        """Synchronous generation — call LLM, parse citations, classify, score."""
         response = self.llm.chat(
             messages=messages,
             temperature=self.config.llm.temperature,
         )
 
-        # 解析来源引用
+        # Parse source citations
         citations = self._extract_citations(
             response["content"],
             search_result.results,
         )
 
-        # 判断回答类型
+        # Classify response type
         response_type = self._classify_response(
             response["content"],
             search_result,
         )
 
-        # 计算置信度
+        # Calculate confidence
         confidence = self._calculate_confidence(
             search_result,
             response["content"],
@@ -543,13 +459,8 @@ class RAGGenerator:
         search_result: SearchResult,
         user_query: str,
     ) -> RAGResponse:
-        """
-        流式生成
-
-        返回的 RAGResponse.content 是空的，实际内容通过 TokenStream 流式输出。
-        此处仅返回元数据。调用方通过 generate_stream() 方法获取 TokenStream。
-        """
-        # 返回占位响应，实际流通过单独方法处理
+        """Streaming placeholder — returns metadata only; actual tokens via generate_stream()."""
+        # Return placeholder; real stream handled by generate_stream method
         return RAGResponse(
             content="",
             response_type=ResponseType.KNOWLEDGE_BASED,
@@ -564,31 +475,17 @@ class RAGGenerator:
         conversation_summary: Optional[str] = None,
         recent_messages: Optional[str] = None,
     ) -> Generator[Tuple[str, Dict], None, RAGResponse]:
-        """
-        流式生成器方法
-
-        每次 yield (content_chunk, metadata_dict)
-        最终返回完整的 RAGResponse
-
-        用法（SSE 模式）:
-            gen = RAGGenerator()
-            for chunk, meta in gen.generate_stream(query, result):
-                # 发送 SSE event
-                yield f"data: {json.dumps({'content': chunk})}\\n\\n"
-        """
+        """Streaming generator yielding (content_chunk, metadata) tuples; returns final RAGResponse."""
         if not search_result.is_reliable:
             content = PromptTemplates.UNCERTAIN_RESPONSE_TEMPLATE
-            word_by_word = list(content)
-            for i in range(0, len(word_by_word), 3):
-                chunk = "".join(word_by_word[i:i + 3])
-                yield chunk, {"type": "token"}
+            yield content, {"type": "token"}
             return RAGResponse(
                 content=content,
                 response_type=ResponseType.UNCERTAIN,
                 confidence=search_result.top_similarity,
             )
 
-        # 构建上下文和消息
+        # Build context and messages
         retrieved_context = self._build_context(search_result)
         messages = PromptTemplates.build_rag_messages(
             user_query=user_query,
@@ -598,7 +495,7 @@ class RAGGenerator:
             scenario=self.scenario,
         )
 
-        # 流式调用 LLM
+        # Stream from LLM
         full_content = ""
         usage = {}
 
@@ -616,12 +513,12 @@ class RAGGenerator:
                     yield "", {"type": "done", "finish_reason": token.finish_reason}
 
         except Exception as e:
-            logger.error(f"[RAGGenerator] 流式生成失败: {e}")
+            logger.error(f"[RAGGenerator] stream generation failed: {e}")
             error_msg = f"抱歉，生成回答时出现错误，请稍后重试。"
             yield error_msg, {"type": "error", "error": str(e)}
             full_content = error_msg
 
-        # 构建最终响应
+        # Build final response
         citations = self._extract_citations(full_content, search_result.results)
         response_type = self._classify_response(full_content, search_result)
         confidence = self._calculate_confidence(search_result, full_content, citations)
@@ -643,13 +540,9 @@ class RAGGenerator:
         content: str,
         results: List[RetrievalResult],
     ) -> List[Citation]:
-        """
-        从生成内容中提取来源引用
-
-        匹配模式：[来源: 1], [来源: 2,3], [来源:1]
-        """
+        """Extract source citations from generated content. Matches [来源: 1] patterns."""
         citations = []
-        # 匹配所有来源引用标记
+        # Match all source citation markers
         pattern = r"\[来源:\s*([\d,\s]+)\]"
         matches = re.findall(pattern, content)
 
@@ -657,13 +550,13 @@ class RAGGenerator:
         for match in matches:
             for num_str in match.split(","):
                 try:
-                    idx = int(num_str.strip()) - 1  # 转换为 0-based
+                    idx = int(num_str.strip()) - 1  # convert to 0-based
                     if 0 <= idx < len(results):
                         cited_indices.add(idx)
                 except ValueError:
                     continue
 
-        # 构建 Citation 对象
+        # Build Citation objects
         for idx in sorted(cited_indices):
             result = results[idx]
             citations.append(Citation(
@@ -680,10 +573,10 @@ class RAGGenerator:
         content: str,
         search_result: SearchResult,
     ) -> ResponseType:
-        """判断回答类型"""
+        """Classify the response type based on signal phrases in the content."""
         content_lower = content.lower()
 
-        # 拒答信号
+        # Fallback / uncertain signals
         uncertain_signals = [
             "无法确定", "无法确认", "不确定", "无法回答",
             "没有相关信息", "知识库中没有", "无法为您确认",
@@ -692,7 +585,7 @@ class RAGGenerator:
         if any(sig in content_lower for sig in uncertain_signals):
             return ResponseType.UNCERTAIN
 
-        # 转人工信号
+        # Human handoff signals
         handoff_signals = [
             "转接人工", "联系人工客服", "人工客服", "提交工单",
             "转人工", "人工坐席",
@@ -700,7 +593,7 @@ class RAGGenerator:
         if any(sig in content_lower for sig in handoff_signals):
             return ResponseType.HANDOFF
 
-        # 澄清信号
+        # Clarification signals
         clarification_signals = [
             "请问", "能否提供", "请提供", "具体是哪", "您是指",
             "需要确认", "进一步说明",
@@ -708,7 +601,7 @@ class RAGGenerator:
         if any(sig in content_lower for sig in clarification_signals):
             return ResponseType.CLARIFICATION
 
-        # 基于知识的回答
+        # Knowledge-based answer
         if search_result.is_reliable:
             return ResponseType.KNOWLEDGE_BASED
 
@@ -721,29 +614,27 @@ class RAGGenerator:
         citations: List[Citation],
     ) -> float:
         """
-        计算回答置信度
-
-        综合考虑：
-          1. 检索最高相似度 (40% 权重)
-          2. 是否有引用来源 (30% 权重)
-          3. 检索结果数量可靠性 (20% 权重)
-          4. 内容长度合理性 (10% 权重)
+        Calculate response confidence as a weighted score:
+          1. retrieval top similarity (40%)
+          2. source citations (30%)
+          3. result count reliability (20%)
+          4. content length adequacy (10%)
         """
         scores = []
 
-        # 1. 检索相似度得分
+        # 1. Retrieval similarity score
         retrieval_score = min(search_result.top_similarity / 0.9, 1.0) if search_result.top_similarity > 0 else 0.0
         scores.append(("retrieval_similarity", retrieval_score, 0.4))
 
-        # 2. 来源引用得分
+        # 2. Source citation score
         citation_score = min(len(citations) / 3.0, 1.0) if citations else 0.0
         scores.append(("source_coverage", citation_score, 0.3))
 
-        # 3. 结果数量得分
+        # 3. Result count score
         count_score = min(search_result.result_count / 5.0, 1.0)
         scores.append(("result_count", count_score, 0.2))
 
-        # 4. 内容长度得分（太短可能不完整）
+        # 4. Content length score (too short may be incomplete)
         content_len = len(content)
         if content_len < 20:
             length_score = 0.2
@@ -755,144 +646,16 @@ class RAGGenerator:
             length_score = 1.0
         scores.append(("content_length", length_score, 0.1))
 
-        # 加权求和
+        # Weighted sum
         total = sum(score * weight for _, score, weight in scores)
         return round(total, 4)
 
 
-# ============================================================================
-# 意图识别器
-# ============================================================================
-class IntentClassifier:
-    """
-    意图识别器
-
-    使用 DeepSeek 做 Few-shot 意图分类。
-    生产环境可在前面加一层规则匹配作为快速通道。
-    """
-
-    INTENTS = [
-        "order_status",
-        "return_exchange",
-        "product_inquiry",
-        "complaint",
-        "technical_issue",
-        "account_issue",
-        "greeting",
-        "unknown",
-    ]
-
-    def __init__(self):
-        self.llm = DeepSeekClient()
-        self.config = get_config()
-
-    def classify(self, user_message: str) -> Dict:
-        """
-        分类用户意图
-
-        返回: {intent, confidence, reason}
-        """
-        # 快速规则匹配（60% 场景命中，节省 API 调用）
-        quick_match = self._rule_based_classify(user_message)
-        if quick_match and quick_match["confidence"] > 0.9:
-            logger.debug(f"[IntentClassifier] 规则命中: {quick_match['intent']}")
-            return quick_match
-
-        # LLM 分类（35% 场景）
-        try:
-            prompt = PromptTemplates.INTENT_CLASSIFICATION_PROMPT.format(
-                user_query=user_message
-            )
-            response = self.llm.chat(
-                messages=[
-                    {"role": "system", "content": "你是一个准确的用户意图分类专家。只输出JSON。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=self.config.llm.intent_temperature,
-                max_tokens=150,
-            )
-
-            result_text = response["content"]
-            # 提取 JSON
-            json_match = re.search(r"\{[^}]+\}", result_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                intent = result.get("intent", "unknown")
-                confidence = float(result.get("confidence", 0.5))
-                reason = result.get("reason", "")
-
-                # 验证意图值
-                if intent not in self.INTENTS:
-                    intent = "unknown"
-                    confidence = 0.3
-
-                return {
-                    "intent": intent,
-                    "confidence": confidence,
-                    "reason": reason,
-                }
-
-        except Exception as e:
-            logger.error(f"[IntentClassifier] LLM 分类失败: {e}")
-
-        # 降级
-        return {"intent": "unknown", "confidence": 0.1, "reason": "classification_failed"}
-
-    def _rule_based_classify(self, message: str) -> Optional[Dict]:
-        """
-        基于规则的快速意图匹配
-
-        适合高频、确定性强的场景。
-        """
-        message_lower = message.lower().strip()
-
-        # 定义规则
-        rules = [
-            (["你好", "嗨", "hello", "hi", "在吗", "您好"], "greeting", 0.95),
-            (["订单", "物流", "发货", "快递", "运单", "tracking"], "order_status", 0.90),
-            (["退货", "退款", "换货", "退换", "return", "refund"], "return_exchange", 0.92),
-            (["投诉", "举报", "差评", "态度差", "太差"], "complaint", 0.95),
-            (["产品", "规格", "价格", "多少钱", "参数"], "product_inquiry", 0.85),
-            (["密码", "登录", "账号", "注册", "绑定"], "account_issue", 0.90),
-            (["报错", "打不开", "闪退", "安装", "配置", "bug"], "technical_issue", 0.85),
-        ]
-
-        for keywords, intent, confidence in rules:
-            if any(kw in message_lower for kw in keywords):
-                return {
-                    "intent": intent,
-                    "confidence": confidence,
-                    "reason": f"rule_match: {keywords[0]}",
-                }
-
-        return None
-
-
-# ============================================================================
-# 独立测试入口
-# ============================================================================
+# /// Self-check
 if __name__ == "__main__":
-    """
-    快速验证生成层功能：
+    """Quick validation of generation layer: python generation_layer.py"""
+    logger.info("--- Generation Layer self-check ---")
 
-        python generation_layer.py
-    """
-    logger.info("=" * 60)
-    logger.info("DeepService Generation Layer — 独立测试")
-    logger.info("=" * 60)
-
-    # 测试意图识别
-    classifier = IntentClassifier()
-    test_messages = [
-        "我的订单12345发货了吗？",
-        "你好",
-        "我要退货，质量太差了！",
-    ]
-    for msg in test_messages:
-        result = classifier.classify(msg)
-        logger.info(f"意图: {msg} → {result['intent']} (置信度: {result['confidence']})")
-
-    # 测试 Prompt 构建
     from retrieval_layer import RetrievalResult
 
     mock_results = [
@@ -914,7 +677,6 @@ if __name__ == "__main__":
 
     generator = RAGGenerator()
     ctx = generator._build_context(search_result)
-    logger.info(f"检索上下文:\n{ctx}")
+    logger.info(f"Context built:\n{ctx}")
 
-    logger.info("=" * 60)
-    logger.info("生成层测试完成 ✓")
+    logger.info("Self-check complete.")

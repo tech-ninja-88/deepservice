@@ -8,7 +8,6 @@ import type { Message } from "@/types/chat";
 interface Props {
   messages: Message[];
   isStreaming: boolean;
-  streamContent: string;
   onRate: (helpful: boolean) => void;
   onRegenerate: () => void;
   className?: string;

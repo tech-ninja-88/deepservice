@@ -1,0 +1,42 @@
+apiVersion: app.sealos.io/v1
+kind: App
+metadata:
+  name: deepservice
+spec:
+  name: deepservice
+  services:
+    # --- Backend API ---
+    - name: backend
+      image: ghcr.io/tech-ninja-88/deepservice-backend:latest
+      ports:
+        - port: 8000
+          expose: true
+      env:
+        - name: DEEPSEEK_API_KEY
+          secretKeyRef:
+            name: deepservice-secrets
+            key: api-key
+        - name: CORS_ORIGINS
+          value: "*"
+      resources:
+        cpu: 500m
+        memory: 512Mi
+      storage:
+        - path: /app/chroma_db
+          size: 1Gi
+
+    # --- Frontend (Next.js) ---
+    # Uses Next.js rewrites to proxy /api/* → backend:8000 internally.
+    # No CORS needed — browser calls same origin.
+    - name: frontend
+      image: ghcr.io/tech-ninja-88/deepservice-frontend:latest
+      ports:
+        - port: 3000
+          expose: true
+      env:
+        # Leave NEXT_PUBLIC_API_URL empty → relative URLs + rewrite proxy
+        - name: NEXT_PUBLIC_API_URL
+          value: "http://backend:8000"
+      resources:
+        cpu: 250m
+        memory: 256Mi

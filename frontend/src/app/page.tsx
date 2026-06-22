@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Menu } from "lucide-react";
 import { ChatWindow } from "@/components/chat/ChatWindow";
 import { ChatInput } from "@/components/chat/ChatInput";
@@ -25,19 +25,14 @@ export default function HomePage() {
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // 加载会话列表
-  const loadConversations = useCallback(async () => {
-    try {
-      const list = await apiClient.getConversations();
-      store.setConversations(list as unknown as Conversation[]);
-    } catch {
-      // 后端未启动时静默
-    }
-  }, [store]);
+  // Keep a stable ref to sendMessage so the quick-question listener never re-registers
+  const sendMessageRef = useRef(sendMessage);
+  sendMessageRef.current = sendMessage;
 
+  // Load conversation list from backend (runs once on mount)
   useEffect(() => {
-    loadConversations();
-  }, [loadConversations]);
+    apiClient.getConversations().then(store.setConversations).catch(() => {});
+  }, []); // store.setConversations is a stable Zustand action
 
   // 选择会话
   const handleSelectConversation = async (id: string) => {
@@ -46,8 +41,7 @@ export default function HomePage() {
     setSidebarOpen(false);
     try {
       const conv = await apiClient.getConversation(id);
-      const msgs = (conv as unknown as { messages: unknown[] }).messages || [];
-      store.setMessages(msgs as never[]);
+      store.setMessages(conv.messages);
     } catch {
       // fallback
     }
@@ -66,28 +60,28 @@ export default function HomePage() {
       await apiClient.deleteConversation(id);
       store.removeConversation(id);
     } catch {
-      // silently fail
+      // Non-critical; log warning in production
     }
   };
 
-  // 推荐问题
+  // Recommended quick-question clicks — stable listener
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
       if (detail) {
         setInputValue(detail);
-        setTimeout(() => sendMessage(detail), 100);
+        setTimeout(() => sendMessageRef.current(detail), 100);
       }
     };
     window.addEventListener("quick-question", handler);
     return () => window.removeEventListener("quick-question", handler);
-  }, [sendMessage, setInputValue]);
+  }, []); // stable — reads latest sendMessage via ref
 
   return (
     <div className="h-screen flex bg-white dark:bg-gray-950">
       {/* Session Sidebar */}
       <SessionPanel
-        conversations={(store.conversations as unknown as Conversation[]) || []}
+        conversations={store.conversations}
         currentId={store.currentId}
         onSelect={handleSelectConversation}
         onNew={handleNewConversation}
@@ -109,7 +103,7 @@ export default function HomePage() {
           <div className="flex-1">
             <h2 className="text-sm font-semibold text-gray-900 dark:text-white truncate">
               {store.currentId
-                ? (store.conversations as unknown as Conversation[]).find((c) => c.id === store.currentId)?.title ||
+                ? store.conversations.find((c) => c.id === store.currentId)?.title ||
                   "对话"
                 : "新对话"}
             </h2>
@@ -117,7 +111,7 @@ export default function HomePage() {
           <div className="flex items-center gap-2">
             {store.isStreaming && (
               <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded-full animate-typing">
-                生成中...
+              生成中...
               </span>
             )}
           </div>
@@ -127,7 +121,6 @@ export default function HomePage() {
         <ChatWindow
           messages={store.messages}
           isStreaming={store.isStreaming}
-          streamContent={store.streamContent}
           onRate={(helpful) => rateResponse(helpful ? 5 : 1)}
           onRegenerate={regenerate}
         />

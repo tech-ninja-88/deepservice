@@ -1,7 +1,4 @@
-/**
- * useChat — 核心对话 Hook
- * 管理流式消息收发、会话生命周期
- */
+/** Core chat hook — manages streaming messages and session lifecycle. */
 "use client";
 
 import { useCallback, useRef, useState } from "react";
@@ -10,139 +7,161 @@ import apiClient, { ApiClient } from "@/lib/api";
 import type { Message, SSETokenEvent } from "@/types/chat";
 
 export function useChat() {
-  const store = useChatStore();
+  // Atomic selectors — each returns a stable reference unless its slice changes.
+  const messages = useChatStore((s) => s.messages);
+  const isStreaming = useChatStore((s) => s.isStreaming);
+  const streamContent = useChatStore((s) => s.streamContent);
+  const error = useChatStore((s) => s.error);
+  const currentId = useChatStore((s) => s.currentId);
+  const selectedRating = useChatStore((s) => s.selectedRating);
+
   const abortRef = useRef<AbortController | null>(null);
   const [inputValue, setInputValue] = useState("");
 
-  /** 发送消息（流式） */
+  /** Send a user message and stream the assistant response. */
   const sendMessage = useCallback(
     async (text?: string) => {
       const content = text || inputValue.trim();
-      if (!content || store.isStreaming) return;
+      if (!content) return;
 
+      const {
+        isStreaming: streaming,
+        currentId: id,
+        addMessage,
+        setStreaming,
+        setError,
+        updateLastAssistant,
+        setCurrentId,
+        setConversations,
+      } = useChatStore.getState();
+
+      if (streaming) return;
       setInputValue("");
 
-      // 添加用户消息
+      // Add user message
       const userMsg: Message = {
         id: `user_${Date.now()}`,
         role: "user",
         content,
         timestamp: new Date().toISOString(),
       };
-      store.addMessage(userMsg);
+      addMessage(userMsg);
 
-      // 占位的 assistant 消息
+      // Placeholder assistant message
       const asstMsg: Message = {
         id: `asst_${Date.now()}`,
         role: "assistant",
         content: "",
         timestamp: new Date().toISOString(),
       };
-      store.addMessage(asstMsg);
-      store.setStreaming({ isStreaming: true, streamContent: "" });
+      addMessage(asstMsg);
+      setStreaming({ isStreaming: true, streamContent: "" });
 
       try {
+        const abortController = new AbortController();
+        abortRef.current = abortController;
+
         const stream = await apiClient.chatStream(
           content,
-          store.currentId || undefined,
-          abortRef.current?.signal
+          id || undefined,
+          abortController.signal
         );
-
-        const fullResponse: { metadata: Record<string, unknown> | null } = {
-          metadata: null,
-        };
 
         ApiClient.parseSSEStream(
           stream,
           // onToken
           (token) => {
-            store.updateLastAssistant(token);
-            store.setStreaming({
-              isStreaming: true,
-              streamContent: store.streamContent + token,
-            });
+            const { updateLastAssistant: upd, setStreaming: setStr, streamContent: sc } =
+              useChatStore.getState();
+            upd(token);
+            setStr({ isStreaming: true, streamContent: sc + token });
           },
           // onEvent
           (event: SSETokenEvent) => {
             if (event.type === "metadata" && event.data) {
-              fullResponse.metadata = event.data as Record<string, unknown>;
               const convId = (event.data as Record<string, unknown>).conversation_id as string;
-              if (convId && !store.currentId) {
-                store.setCurrentId(convId);
+              if (convId) {
+                const { currentId: cid, setCurrentId: setCid } = useChatStore.getState();
+                if (!cid) setCid(convId);
               }
             }
           },
           // onError
           (err) => {
-            store.setError(err.message);
-            store.updateLastAssistant(`\n\n⚠️ 抱歉，回复生成失败：${err.message}`);
+            useChatStore.getState().setError(err.message);
+            useChatStore.getState().updateLastAssistant(
+              `\n\n⚠️ Sorry, response generation failed: ${err.message}`
+            );
           },
           // onDone
           () => {
-            store.setStreaming({ isStreaming: false, streamContent: "" });
-            if (store.currentId) {
-              apiClient.getConversations().then(store.setConversations).catch(() => {});
+            const { setStreaming: done, currentId: cid, setConversations: setConvs } =
+              useChatStore.getState();
+            done({ isStreaming: false, streamContent: "" });
+            if (cid) {
+              apiClient.getConversations().then(setConvs).catch(() => {});
             }
           }
         );
-
-        abortRef.current = abortRef.current;
       } catch (err) {
-        store.setError(err instanceof Error ? err.message : "Unknown error");
-        store.setStreaming({ isStreaming: false, streamContent: "" });
+        useChatStore.getState().setError(
+          err instanceof Error ? err.message : "Unknown error"
+        );
+        useChatStore.getState().setStreaming({ isStreaming: false, streamContent: "" });
       }
     },
-    [inputValue, store]
+    [inputValue]
   );
 
-  /** 取消当前生成 */
+  /** Cancel the current streaming generation. */
   const cancelGeneration = useCallback(() => {
     abortRef.current?.abort();
-    store.setStreaming({ isStreaming: false, streamContent: "" });
+    useChatStore.getState().setStreaming({ isStreaming: false, streamContent: "" });
     abortRef.current = null;
-  }, [store]);
+  }, []);
 
-  /** 重新生成 */
+  /** Regenerate the last assistant response. */
   const regenerate = useCallback(() => {
-    const msgs = store.messages;
-    if (msgs.length > 0 && msgs[msgs.length - 1].role === "assistant") {
-      const newMsgs = msgs.slice(0, -1);
-      store.setMessages(newMsgs);
-    }
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === "user") {
-        sendMessage(msgs[i].content);
-        break;
-      }
-    }
-  }, [store, sendMessage]);
+    const { messages: msgs, setMessages } = useChatStore.getState();
+    // Find the last user message before mutating state
+    const lastUserMsg = [...msgs].reverse().find((m) => m.role === "user");
+    if (!lastUserMsg) return;
 
-  /** 评价 */
+    // Remove last assistant bubble if present
+    if (msgs.length > 0 && msgs[msgs.length - 1].role === "assistant") {
+      setMessages(msgs.slice(0, -1));
+    }
+
+    sendMessage(lastUserMsg.content);
+  }, [sendMessage]);
+
+  /** Submit a rating for the current conversation. */
   const rateResponse = useCallback(
     async (rating: number, comment?: string) => {
-      if (!store.currentId) return;
-      store.setRating(rating);
+      const { currentId: id, setRating } = useChatStore.getState();
+      if (!id) return;
+      setRating(rating);
       try {
-        await apiClient.rateConversation(store.currentId, rating, comment);
+        await apiClient.rateConversation(id, rating, comment);
       } catch {
-        // silently fail
+        // fire-and-forget; non-critical
       }
     },
-    [store]
+    []
   );
 
   return {
-    messages: store.messages,
-    isStreaming: store.isStreaming,
-    streamContent: store.streamContent,
-    error: store.error,
+    messages,
+    isStreaming,
+    streamContent,
+    error,
     inputValue,
     setInputValue,
     sendMessage,
     cancelGeneration,
     regenerate,
     rateResponse,
-    selectedRating: store.selectedRating,
-    conversationId: store.currentId,
+    selectedRating,
+    conversationId: currentId,
   };
 }

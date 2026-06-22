@@ -1,38 +1,7 @@
 """
-=============================================================================
-DeepService 对话管理 — 人工转接模块 (Human Transfer)
-=============================================================================
-职责：
-  1. 转人工触发条件判断（多维度触发机制）
-  2. 对话上下文的完整打包和透传
-  3. WebSocket 实时消息通道
-  4. 人工坐席接管与归还
-
-企业级设计原则：
-  - 六种触发条件覆盖所有转人工场景
-  - 上下文透传确保人工不需要重复询问
-  - 转接过程对用户透明，无需刷新页面
-  - 支持排队、超时、拒绝等异常情况
-
-触发条件：
-  ┌─────────────────────────────────────────────────────────────┐
-  │ 1. 用户主动要求（回复"人工"、"转人工"等）                     │
-  │ 2. 关键词触发（投诉、紧急、生命危险等敏感词）                  │
-  │ 3. 置信度低（连续2轮低置信度+追问无效）                       │
-  │ 4. 负面情感累积（连续3轮负面情感）                            │
-  │ 5. 特定意图强制转接（投诉、账号恢复等）                       │
-  │ 6. 结构化流程失败（槽位填充3次失败）                          │
-  └─────────────────────────────────────────────────────────────┘
-
-WebSocket 通道设计：
-  用户端 ←→ WebSocket ←→ 坐席端
-    │                        │
-    │  send(message)         │  receive(message)
-    │  on_message(callback)  │  send(message)
-    │                        │
-    └──────── WebSocket Server ─────────┘
-              消息路由 + 状态同步
-=============================================================================
+Human transfer service: multi-trigger detection, context packaging, agent assignment, WebSocket relay.
+Six trigger conditions cover user requests, keywords, low confidence, negative sentiment, forced intents,
+and flow failures. Context is packed so agents don't re-ask basic info.
 """
 
 import json
@@ -49,67 +18,61 @@ from loguru import logger
 from config import get_config
 
 
-# ============================================================================
-# 枚举与常量
-# ============================================================================
+# ... Enums & constants
 class TransferTrigger(str, Enum):
-    """转接触发原因"""
-    USER_REQUESTED = "user_requested"             # 用户主动要求
-    KEYWORD_DETECTED = "keyword_detected"         # 敏感关键词
-    LOW_CONFIDENCE = "low_confidence"             # 置信度不足
-    NEGATIVE_SENTIMENT = "negative_sentiment"     # 负面情感累积
-    INTENT_FORCED = "intent_forced"               # 意图强制转接
-    FLOW_FAILED = "flow_failed"                   # 流程失败
-    ADMIN_TRANSFER = "admin_transfer"             # 管理员主动接入
+    """Transfer trigger reasons"""
+    USER_REQUESTED = "user_requested"             # user explicitly asked
+    KEYWORD_DETECTED = "keyword_detected"         # sensitive keyword hit
+    LOW_CONFIDENCE = "low_confidence"             # confidence too low
+    NEGATIVE_SENTIMENT = "negative_sentiment"     # negative sentiment accumulated
+    INTENT_FORCED = "intent_forced"               # intent forced transfer
+    FLOW_FAILED = "flow_failed"                   # structured flow failed
+    ADMIN_TRANSFER = "admin_transfer"             # admin initiated
 
 
 class TransferStatus(str, Enum):
-    """转接状态"""
-    PENDING = "pending"               # 等待坐席接听
-    QUEUED = "queued"                 # 排队中
-    CONNECTED = "connected"           # 已接通
-    AGENT_DISCONNECTED = "disconnected"  # 坐席断连
-    COMPLETED = "completed"           # 已完成
-    TIMEOUT = "timeout"               # 超时
-    REJECTED = "rejected"             # 被拒绝
-    ERROR = "error"                   # 异常
+    """Transfer lifecycle statuses"""
+    PENDING = "pending"               # waiting for agent to accept
+    QUEUED = "queued"                 # in queue
+    CONNECTED = "connected"           # agent connected
+    AGENT_DISCONNECTED = "disconnected"  # agent disconnected
+    COMPLETED = "completed"           # completed
+    TIMEOUT = "timeout"               # timed out
+    REJECTED = "rejected"             # rejected
+    ERROR = "error"                   # error state
 
 
-# ============================================================================
-# 数据结构
-# ============================================================================
+# ... Data structures
 @dataclass
 class TransferContext:
     """
-    转接上下文 — 完整打包给人工坐席的信息
-
-    设计原则：人工坐席看到这个不需要再问任何基本信息。
+    Packed context handed to the human agent — they should not need to re-ask anything.
     """
-    # 基本信息
+    # Basic info
     transfer_id: str = field(default_factory=lambda: f"transfer_{uuid.uuid4().hex[:10]}")
     session_id: str = ""
     user_id: str = "anonymous"
     trigger: TransferTrigger = TransferTrigger.USER_REQUESTED
 
-    # 对话摘要（给坐席的"预习材料"）
+    # Conversation summary (preview for the agent)
     conversation_summary: str = ""
-    recent_messages: List[Dict] = field(default_factory=list)  # 最近 5 轮
+    recent_messages: List[Dict] = field(default_factory=list)  # last 5 turns
     current_intent: str = ""
     tracked_entities: Dict[str, str] = field(default_factory=dict)
 
-    # 用户信息
+    # User info
     user_profile_text: str = ""
     user_sentiment_avg: float = 0.5
     complaint_history: int = 0
 
-    # 处理信息
-    priority: int = 0                   # 优先级（0=紧急, 1=普通, 2=低）
+    # Processing info
+    priority: int = 0                   # 0=urgent, 1=normal, 2=low
     created_at: float = field(default_factory=time.time)
     status: TransferStatus = TransferStatus.PENDING
-    assigned_agent: str = ""            # 分配的坐席 ID
+    assigned_agent: str = ""
     agent_name: str = ""
 
-    # 元数据
+    # Metadata
     channel: str = "web"
     user_agent: str = ""
     ip_address: str = ""
@@ -138,7 +101,7 @@ class TransferContext:
         }
 
     def to_agent_display(self) -> str:
-        """生成给坐席看的格式化显示"""
+        """Format context as a human-readable agent display"""
         lines = [
             "=" * 40,
             f"转接请求 #{self.transfer_id[:10]}",
@@ -171,21 +134,19 @@ class TransferContext:
 
 @dataclass
 class AgentInfo:
-    """坐席信息"""
+    """Human agent profile"""
     agent_id: str
     name: str = ""
-    skills: List[str] = field(default_factory=list)  # 技能标签：售前、售后、技术
+    skills: List[str] = field(default_factory=list)  # pre-sales, after-sales, technical
     status: str = "offline"                           # online / busy / offline
     current_sessions: int = 0
     max_sessions: int = 5
 
 
-# ============================================================================
-# WebSocket 消息（与具体框架解耦）
-# ============================================================================
+# ... WebSocket message (framework-agnostic)
 @dataclass
 class WSMessage:
-    """WebSocket 消息结构（框架无关）"""
+    """Framework-agnostic WebSocket message"""
     type: str                           # message / system / status / typing / close
     sender: str                         # "user" | "agent" | "system"
     content: str = ""
@@ -202,31 +163,27 @@ class WSMessage:
         return cls(**data)
 
 
-# ============================================================================
-# 触发条件检测器
-# ============================================================================
+# ... Trigger condition detector
 class TransferTriggerDetector:
     """
-    转人工触发条件检测器
-
-    六维度检测，任一命中即触发转接。
+    Multi-dimensional trigger detector — any one hit initiates a transfer.
     """
 
-    # 用户主动转接触发词
+    # User-requested keywords
     USER_REQUEST_KEYWORDS = [
         "人工", "转人工", "客服人员", "人工客服",
         "真人", "转接", "人工坐席", "找人工",
         "有人吗", "不是机器人",
     ]
 
-    # 敏感/紧急关键词（直接触发转接）
+    # Sensitive/urgent keywords (immediate transfer)
     URGENT_KEYWORDS = [
         "生命危险", "人身安全", "报警", "诈骗",
         "法院", "律师函", "消协", "315",
         "媒体曝光", "曝光你们", "记者",
     ]
 
-    # 负面情感词
+    # Negative sentiment words
     NEGATIVE_SENTIMENT_WORDS = [
         "气死", "垃圾", "骗子", "太差", "坑人",
         "失望", "投诉", "举报", "差评", "退款",
@@ -234,10 +191,10 @@ class TransferTriggerDetector:
     ]
 
     def __init__(self):
-        # 会话级别计数器
-        self._negative_count: Dict[str, int] = {}           # session_id → 负面计数
-        self._low_confidence_count: Dict[str, int] = {}     # session_id → 低置信度计数
-        self._clarify_count: Dict[str, int] = {}            # session_id → 追问次数
+        # Per-session counters
+        self._negative_count: Dict[str, int] = {}           # session_id -> negative count
+        self._low_confidence_count: Dict[str, int] = {}     # session_id -> low-confidence count
+        self._clarify_count: Dict[str, int] = {}            # session_id -> clarify count
 
     def detect(
         self,
@@ -248,108 +205,96 @@ class TransferTriggerDetector:
         sentiment: float = 0.5,
     ) -> Optional[TransferTrigger]:
         """
-        多维度检测是否需要转人工
-
-        返回触发的 TransferTrigger，或 None（不需要转接）。
+        Check all triggers; returns the matching TransferTrigger or None.
         """
         msg_lower = user_message.lower()
 
-        # 条件1: 用户主动要求
+        # Condition 1: user explicitly requests human
         if any(kw in msg_lower for kw in self.USER_REQUEST_KEYWORDS):
-            logger.info(f"[TransferTrigger] 用户主动请求转人工: {session_id[:12]}")
+            logger.info(f"[TransferTrigger] User requested transfer: {session_id[:12]}")
             return TransferTrigger.USER_REQUESTED
 
-        # 条件2: 紧急/敏感关键词
+        # Condition 2: sensitive/urgent keywords
         if any(kw in msg_lower for kw in self.URGENT_KEYWORDS):
-            logger.warning(f"[TransferTrigger] 敏感关键词触发: {session_id[:12]}")
+            logger.warning(f"[TransferTrigger] Sensitive keyword triggered: {session_id[:12]}")
             return TransferTrigger.KEYWORD_DETECTED
 
-        # 条件3: 特定意图强制转接
+        # Condition 3: intent forces transfer
         if intent in ("complaint", "transfer_human"):
-            logger.info(f"[TransferTrigger] 意图强制转接: intent={intent}")
+            logger.info(f"[TransferTrigger] Intent-forced transfer: intent={intent}")
             return TransferTrigger.INTENT_FORCED
 
-        # 条件4: 连续低置信度
+        # Condition 4: consecutive low confidence
         if confidence < 0.4:
             self._low_confidence_count[session_id] = (
                 self._low_confidence_count.get(session_id, 0) + 1
             )
             if self._low_confidence_count.get(session_id, 0) >= 3:
                 logger.warning(
-                    f"[TransferTrigger] 连续低置信度触发: "
+                    f"[TransferTrigger] Low confidence triggered: "
                     f"count={self._low_confidence_count[session_id]}"
                 )
                 return TransferTrigger.LOW_CONFIDENCE
         else:
-            self._low_confidence_count[session_id] = 0  # 重置
+            self._low_confidence_count[session_id] = 0  # reset
 
-        # 条件5: 连续负面情感
+        # Condition 5: consecutive negative sentiment
         if sentiment < 0.3:
             self._negative_count[session_id] = (
                 self._negative_count.get(session_id, 0) + 1
             )
             if self._negative_count.get(session_id, 0) >= 3:
                 logger.warning(
-                    f"[TransferTrigger] 负面情感累积触发: "
+                    f"[TransferTrigger] Negative sentiment triggered: "
                     f"count={self._negative_count[session_id]}"
                 )
                 return TransferTrigger.NEGATIVE_SENTIMENT
         else:
             self._negative_count[session_id] = max(
                 0, self._negative_count.get(session_id, 0) - 1
-            )  # 逐渐减少
+            )  # gradually decrease
 
         return None
 
     def reset_counts(self, session_id: str):
-        """重置会话计数器（转接完成后）"""
+        """Reset per-session counters after transfer"""
         self._negative_count.pop(session_id, None)
         self._low_confidence_count.pop(session_id, None)
         self._clarify_count.pop(session_id, None)
 
 
-# ============================================================================
-# 坐席管理器
-# ============================================================================
+# ... Agent manager
 class AgentManager:
     """
-    坐席管理器
-
-    管理在线坐席、分配任务、排队。
+    Manages online agents, task assignment, and queuing.
     """
 
     def __init__(self):
         self._agents: Dict[str, AgentInfo] = {}
         self._transfer_queue: List[TransferContext] = []
-        self._active_transfers: Dict[str, TransferContext] = {}  # transfer_id → context
+        self._active_transfers: Dict[str, TransferContext] = {}  # transfer_id -> context
         self._lock = threading.Lock()
-        logger.info("[AgentManager] 坐席管理器初始化")
+        logger.info("[AgentManager] Agent manager initialized")
 
     def register_agent(self, agent: AgentInfo):
-        """注册坐席"""
+        """Register an agent"""
         with self._lock:
             self._agents[agent.agent_id] = agent
             logger.info(f"[AgentManager] 坐席注册: {agent.agent_id} ({agent.name})")
 
     def unregister_agent(self, agent_id: str):
-        """注销坐席"""
+        """Unregister an agent"""
         with self._lock:
             self._agents.pop(agent_id, None)
-            logger.info(f"[AgentManager] 坐席注销: {agent_id}")
+            logger.info(f"[AgentManager] Agent unregistered: {agent_id}")
 
     def assign_transfer(self, transfer: TransferContext) -> Optional[str]:
         """
-        分配转接请求给坐席
-
-        分配策略：
-          1. 按技能匹配
-          2. 按负载均衡（当前处理数最少的优先）
-          3. 无可用坐席时加入队列
-
-        返回坐席 ID 或 None（已排队）
+        Assign transfer to an agent by skill match + load balancing.
+        Returns agent_id or None if queued.
         """
         with self._lock:
-            # 查找空闲且技能匹配的坐席
+            # Find available matching agents
             available = [
                 a for a in self._agents.values()
                 if a.status == "online"
@@ -357,22 +302,22 @@ class AgentManager:
             ]
 
             if not available:
-                # 排队
+                # Queue
                 transfer.status = TransferStatus.QUEUED
                 self._transfer_queue.append(transfer)
                 logger.info(
-                    f"[AgentManager] 无可用坐席，进入排队 "
-                    f"(队列长度: {len(self._transfer_queue)})"
+                    f"[AgentManager] No available agents, queued "
+                    f"(queue length: {len(self._transfer_queue)})"
                 )
                 return None
 
-            # 按技能匹配排序
+            # Sort by skill match
             available.sort(key=lambda a: (
                 self._skill_match_score(a, transfer),
-                -a.current_sessions,  # 负载少的优先
+                -a.current_sessions,  # fewer current sessions = higher priority
             ))
 
-            # 分配给最匹配的坐席
+            # Assign to best match
             agent = available[0]
             agent.current_sessions += 1
             transfer.status = TransferStatus.PENDING
@@ -381,29 +326,29 @@ class AgentManager:
 
             self._active_transfers[transfer.transfer_id] = transfer
             logger.info(
-                f"[AgentManager] 转接 {transfer.transfer_id[:10]} "
-                f"分配给坐席 {agent.agent_id}"
+                f"[AgentManager] Transfer {transfer.transfer_id[:10]} "
+                f"assigned to agent {agent.agent_id}"
             )
             return agent.agent_id
 
     def complete_transfer(self, transfer_id: str):
-        """完成转接"""
+        """Complete a transfer"""
         with self._lock:
             transfer = self._active_transfers.pop(transfer_id, None)
             if transfer:
                 transfer.status = TransferStatus.COMPLETED
-                # 释放坐席
+                # Release agent
                 if transfer.assigned_agent in self._agents:
                     self._agents[transfer.assigned_agent].current_sessions -= 1
 
     def reject_transfer(self, transfer_id: str, reason: str = ""):
-        """坐席拒绝转接 — 重新分配"""
+        """Agent rejected transfer — reassign"""
         with self._lock:
             transfer = self._active_transfers.pop(transfer_id, None)
             if transfer:
                 transfer.status = TransferStatus.REJECTED
-                transfer.notes = f"拒绝原因: {reason}"
-                # 重新排队
+                transfer.notes = f"Rejected: {reason}"
+                # Re-queue at front
                 transfer.assigned_agent = ""
                 self._transfer_queue.insert(0, transfer)
 
@@ -414,94 +359,85 @@ class AgentManager:
         return sum(1 for a in self._agents.values() if a.status == "online")
 
     def _skill_match_score(self, agent: AgentInfo, transfer: TransferContext) -> int:
-        """计算坐席技能匹配得分"""
+        """Score skill match between agent and transfer (negative so .sort() places best first)"""
         score = 0
         tags_lower = [t.lower() for t in transfer.tags]
         for skill in agent.skills:
             if skill.lower() in tags_lower:
                 score += 1
-        return -score  # 负数让 .sort() 时高分在前
+        return -score
 
 
-# ============================================================================
-# WebSocket 消息通道（框架无关抽象）
-# ============================================================================
+# ... WebSocket message channel (framework-agnostic)
 class WebSocketChannel:
     """
-    WebSocket 消息通道
-
-    框架无关的设计（可以挂接到 FastAPI / Flask-SocketIO / Django Channels）。
-
-    通道模式：
-      - system → user:  系统通知用户（排队、转接成功）
-      - user → agent:   用户消息透传给坐席
-      - agent → user:   坐席消息透传给用户
-      - system → agent: 系统通知坐席（新转接、用户状态）
+    Framework-agnostic WebSocket message channel.
+    Routes: system<->user, user<->agent, system<->agent (queue, handoff, status).
     """
 
     def __init__(self):
-        # 连接注册表
-        self._user_connections: Dict[str, Any] = {}      # session_id → ws connection
-        self._agent_connections: Dict[str, Any] = {}     # agent_id → ws connection
+        # Connection registries
+        self._user_connections: Dict[str, Any] = {}      # session_id -> ws connection
+        self._agent_connections: Dict[str, Any] = {}     # agent_id -> ws connection
         self._connection_lock = threading.Lock()
 
-        # 消息处理回调
+        # Message callbacks
         self._on_user_message: Optional[Callable] = None
         self._on_agent_message: Optional[Callable] = None
 
-        logger.info("[WebSocketChannel] 消息通道初始化")
+        logger.info("[WebSocketChannel] Message channel initialized")
 
     def register_user(self, session_id: str, connection: Any):
-        """注册用户 WebSocket 连接"""
+        """Register user WebSocket connection"""
         with self._connection_lock:
             self._user_connections[session_id] = connection
             logger.debug(f"[WebSocketChannel] 用户上线: {session_id[:12]}")
 
     def register_agent(self, agent_id: str, connection: Any):
-        """注册坐席 WebSocket 连接"""
+        """Register agent WebSocket connection"""
         with self._connection_lock:
             self._agent_connections[agent_id] = connection
-            logger.debug(f"[WebSocketChannel] 坐席上线: {agent_id}")
+            logger.debug(f"[WebSocketChannel] Agent online: {agent_id}")
 
     def unregister_user(self, session_id: str):
-        """注销用户连接"""
+        """Unregister user connection"""
         with self._connection_lock:
             self._user_connections.pop(session_id, None)
 
     def unregister_agent(self, agent_id: str):
-        """注销坐席连接"""
+        """Unregister agent connection"""
         with self._connection_lock:
             self._agent_connections.pop(agent_id, None)
 
     def send_to_user(self, session_id: str, message: WSMessage) -> bool:
-        """发送消息给用户"""
+        """Send message to user"""
         conn = self._user_connections.get(session_id)
         if conn:
             try:
                 self._ws_send(conn, message.to_json())
                 return True
             except Exception as e:
-                logger.error(f"[WebSocketChannel] 发送用户消息失败: {e}")
+                logger.error(f"[WebSocketChannel] Send to user failed: {e}")
                 return False
 
-        # 离线消息处理（生产环境：存储到 Redis，用户上线后推送）
-        logger.debug(f"[WebSocketChannel] 用户 {session_id[:12]} 离线，消息暂存")
+        # Offline message (production: store in Redis, push on reconnect)
+        logger.debug(f"[WebSocketChannel] User {session_id[:12]} offline, message held")
         return False
 
     def send_to_agent(self, agent_id: str, message: WSMessage) -> bool:
-        """发送消息给坐席"""
+        """Send message to agent"""
         conn = self._agent_connections.get(agent_id)
         if conn:
             try:
                 self._ws_send(conn, message.to_json())
                 return True
             except Exception as e:
-                logger.error(f"[WebSocketChannel] 发送坐席消息失败: {e}")
+                logger.error(f"[WebSocketChannel] Send to agent failed: {e}")
                 return False
         return False
 
     def broadcast_to_agents(self, message: WSMessage):
-        """广播给所有在线坐席"""
+        """Broadcast to all online agents"""
         for agent_id, conn in list(self._agent_connections.items()):
             try:
                 self._ws_send(conn, message.to_json())
@@ -509,63 +445,52 @@ class WebSocketChannel:
                 pass
 
     def set_on_user_message(self, callback: Callable):
-        """设置用户消息处理回调"""
+        """Set callback for user messages"""
         self._on_user_message = callback
 
     def set_on_agent_message(self, callback: Callable):
-        """设置坐席消息处理回调"""
+        """Set callback for agent messages"""
         self._on_agent_message = callback
 
     def handle_user_message(self, session_id: str, raw_message: str):
-        """处理来自用户的消息"""
+        """Handle incoming user message"""
         try:
             msg = WSMessage.from_json(raw_message)
             if self._on_user_message:
                 self._on_user_message(session_id, msg)
         except Exception as e:
-            logger.error(f"[WebSocketChannel] 处理用户消息失败: {e}")
+            logger.error(f"[WebSocketChannel] Handle user message failed: {e}")
 
     def handle_agent_message(self, agent_id: str, raw_message: str):
-        """处理来自坐席的消息"""
+        """Handle incoming agent message"""
         try:
             msg = WSMessage.from_json(raw_message)
             if self._on_agent_message:
                 self._on_agent_message(agent_id, msg)
         except Exception as e:
-            logger.error(f"[WebSocketChannel] 处理坐席消息失败: {e}")
+            logger.error(f"[WebSocketChannel] Handle agent message failed: {e}")
 
     def _ws_send(self, connection: Any, message: str):
         """
-        发送 WebSocket 消息
-
-        子类可重写此方法适配不同框架。
+        Send WebSocket message. Override to adapt to different frameworks.
         """
         # FastAPI WebSocket
         if hasattr(connection, "send_text"):
-            # 使用 asyncio
             import asyncio
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import asyncio
-                    asyncio.create_task(connection.send_text(message))
-                else:
-                    loop.run_until_complete(connection.send_text(message))
+                loop = asyncio.get_running_loop()
+                asyncio.create_task(connection.send_text(message))
             except RuntimeError:
-                pass
-        # 其他框架的通用回退
+                pass  # sync context — WS send unavailable
+        # Generic fallback
         elif hasattr(connection, "send"):
             connection.send(message)
 
 
-# ============================================================================
-# 人工转接服务（统一门面）
-# ============================================================================
+# ... Human transfer service (public facade)
 class HumanTransferService:
     """
-    人工转接服务 — 对外统一接口
-
-    整合了转接触发检测、坐席分配、会话透传、WebSocket消息通道。
+    Public API integrating trigger detection, agent assignment, session relay, and WebSocket.
     """
 
     def __init__(self):
@@ -574,10 +499,10 @@ class HumanTransferService:
         self.ws = WebSocketChannel()
         self.config = get_config()
 
-        # 转接历史
+        # Transfer history
         self._transfer_history: Dict[str, TransferContext] = {}
 
-        logger.info("[HumanTransferService] 初始化完成")
+        logger.info("[HumanTransferService] Initialized")
 
     def check_trigger(
         self,
@@ -587,7 +512,7 @@ class HumanTransferService:
         confidence: float = 1.0,
         sentiment: float = 0.5,
     ) -> Optional[TransferTrigger]:
-        """检查是否需要触发转人工"""
+        """Check if transfer should be triggered"""
         return self.detector.detect(
             session_id, user_message, intent, confidence, sentiment
         )
@@ -605,13 +530,9 @@ class HumanTransferService:
         **kwargs,
     ) -> TransferContext:
         """
-        发起转人工
-
-        1. 打包完整上下文
-        2. 分配坐席
-        3. WebSocket 通知
+        Initiate transfer: pack context, assign agent, notify via WebSocket.
         """
-        # 构建转接上下文
+        # Build transfer context
         transfer = TransferContext(
             session_id=session_id,
             user_id=user_id,
@@ -626,15 +547,15 @@ class HumanTransferService:
             **kwargs,
         )
 
-        # 分配坐席
+        # Assign agent
         agent_id = self.agent_manager.assign_transfer(transfer)
 
-        # 保存记录
+        # Save record
         self._transfer_history[transfer.transfer_id] = transfer
 
-        # 通知用户
+        # Notify user
         if agent_id:
-            # 已分配坐席 — 通知用户
+            # Agent assigned — notify user
             self.ws.send_to_user(session_id, WSMessage(
                 type="system",
                 sender="system",
@@ -643,11 +564,11 @@ class HumanTransferService:
                 metadata={"agent_id": agent_id, "agent_name": transfer.agent_name},
             ))
 
-            # 通知坐席
+            # Notify agent
             self.ws.send_to_agent(agent_id, WSMessage(
                 type="system",
                 sender="system",
-                content="新的客户转接请求",
+                content="New customer transfer request",
                 transfer_id=transfer.transfer_id,
                 metadata={
                     "transfer_context": transfer.to_dict(),
@@ -655,7 +576,7 @@ class HumanTransferService:
                 },
             ))
         else:
-            # 排队中 — 通知用户等待
+            # Queued — notify user to wait
             queue_pos = self.agent_manager.get_queue_length()
             self.ws.send_to_user(session_id, WSMessage(
                 type="system",
@@ -669,7 +590,7 @@ class HumanTransferService:
             ))
 
         logger.info(
-            f"[HumanTransferService] 转接已发起: {transfer.transfer_id[:10]} "
+            f"[HumanTransferService] Transfer initiated: {transfer.transfer_id[:10]} "
             f"(trigger={trigger.value}, agent={agent_id or 'queued'})"
         )
 
@@ -681,7 +602,7 @@ class HumanTransferService:
         transfer_id: str,
         content: str,
     ):
-        """将用户消息转发给坐席"""
+        """Relay user message to agent"""
         transfer = self._transfer_history.get(transfer_id)
         if not transfer or not transfer.assigned_agent:
             return
@@ -700,7 +621,7 @@ class HumanTransferService:
         transfer_id: str,
         content: str,
     ):
-        """将坐席消息转发给用户"""
+        """Relay agent message to user"""
         transfer = self._transfer_history.get(transfer_id)
         if not transfer:
             return
@@ -718,12 +639,12 @@ class HumanTransferService:
         transfer_id: str,
         reason: str = "completed",
     ):
-        """结束转接"""
+        """End a transfer session"""
         transfer = self._transfer_history.get(transfer_id)
         if not transfer:
             return
 
-        # 通知双方
+        # Notify both parties
         self.ws.send_to_user(transfer.session_id, WSMessage(
             type="system",
             sender="system",
@@ -736,20 +657,20 @@ class HumanTransferService:
             self.ws.send_to_agent(transfer.assigned_agent, WSMessage(
                 type="system",
                 sender="system",
-                content=f"会话 {transfer.session_id[:12]} 转接已结束",
+                content=f"Session {transfer.session_id[:12]} transfer ended",
                 transfer_id=transfer_id,
                 metadata={"reason": reason},
             ))
 
-        # 清理
+        # Cleanup
         self.agent_manager.complete_transfer(transfer_id)
         self.detector.reset_counts(transfer.session_id)
-        logger.info(f"[HumanTransferService] 转接结束: {transfer_id[:10]} ({reason})")
+        logger.info(f"[HumanTransferService] Transfer ended: {transfer_id[:10]} ({reason})")
 
 
-# ============================================================================
-# 全局单例
-# ============================================================================
+# Thread-safe singleton — WebSocket callbacks can race during handoff
+import threading
+
 _transfer_service: Optional[HumanTransferService] = None
 _transfer_lock = threading.Lock()
 
@@ -763,18 +684,13 @@ def get_human_transfer_service() -> HumanTransferService:
     return _transfer_service
 
 
-# ============================================================================
-# 独立测试
-# ============================================================================
+# ... Self-check
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("DeepService Human Transfer — 独立测试")
-    logger.info("=" * 60)
-
+    logger.info("Human Transfer self-check")
     service = HumanTransferService()
 
-    # 测试1：触发检测
-    logger.info("\n[测试1] 转接触发检测")
+    # 1. Trigger detection
+    logger.info("[1] Trigger detection")
     test_cases = [
         ("帮我转人工", "order_status", 0.9),
         ("你们太垃圾了", "complaint", 0.9),
@@ -782,10 +698,10 @@ if __name__ == "__main__":
     ]
     for msg, intent, conf in test_cases:
         trigger = service.check_trigger("test_session", msg, intent, conf)
-        logger.info(f"  '{msg}' → {trigger.value if trigger else '不触发'}")
+        logger.info(f"  '{msg}' -> {trigger.value if trigger else 'no trigger'}")
 
     # 测试2：发起转接
-    logger.info("\n[测试2] 发起转接")
+    logger.info("[2] Initiate transfer")
     transfer = service.initiate_transfer(
         session_id="test_session",
         trigger=TransferTrigger.USER_REQUESTED,
@@ -800,13 +716,10 @@ if __name__ == "__main__":
         ],
         tracked_entities={"order_id": "#20240001"},
     )
-    logger.info(f"  转接ID: {transfer.transfer_id}")
-    logger.info(f"  状态: {transfer.status.value}")
+    logger.info(f"  Transfer ID: {transfer.transfer_id}, status: {transfer.status.value}")
 
-    # 测试3：上下文打包
-    logger.info("\n[测试3] 转接上下文（坐席视角）")
-    display = transfer.to_agent_display()
-    logger.info(f"\n{display}")
+    # 3. Context display
+    logger.info("[3] Agent display")
+    logger.info(f"\n{transfer.to_agent_display()}")
 
-    logger.info("=" * 60)
-    logger.info("人工转接测试完成 ✓")
+    logger.info("Human transfer self-check complete.")

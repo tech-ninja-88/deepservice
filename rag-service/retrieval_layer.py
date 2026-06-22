@@ -1,21 +1,7 @@
 """
-=============================================================================
-DeepService RAG — 混合检索模块 (Retrieval Layer)
-=============================================================================
-职责：
-  1. 语义向量检索 — 基于 Embedding 的语义相似度搜索
-  2. 关键词 BM25 检索 — 精确关键词匹配
-  3. 混合检索融合 — RRF 算法融合语义+关键词结果
-  4. 重排序 (Re-ranking) — 精细化打分，过滤低相关度干扰项
-
-企业级设计原则：
-  - 单一检索方式存在盲区：向量检索对专有名词不敏感，关键词检索无法理解语义
-  - 混合检索 + 重排序是当前工业界最成熟的方案
-  - 重排序模型可显著提升 Top-5 召回精度
-
-参考：
-  [reference:3] — 在初步召回后引入重排序模型进行精细化打分，过滤相关度低于阈值的干扰项
-=============================================================================
+Retrieval Layer — hybrid search combining semantic vector search, BM25 keyword matching,
+RRF fusion, and reranking. Vector alone misses exact keywords; BM25 alone misses semantics;
+together they complement each other.
 """
 
 import hashlib
@@ -31,28 +17,25 @@ from config import get_config, RetrievalConfig
 from data_layer import VectorStoreManager, EmbeddingGenerator, Chunk
 
 
-# ============================================================================
-# 检索结果数据结构
-# ============================================================================
+# /// Retrieval result data structures
 @dataclass
 class RetrievalResult:
-    """统一检索结果"""
+    """Unified retrieval result across all retrieval stages."""
     chunk_id: str
     content: str
     metadata: Dict = field(default_factory=dict)
 
-    # 各阶段得分
-    vector_score: float = 0.0       # 向量检索得分（归一化后）
-    bm25_score: float = 0.0         # BM25 检索得分（归一化后）
-    fusion_score: float = 0.0       # 融合得分（RRF）
-    rerank_score: float = 0.0       # 重排序得分
-    final_score: float = 0.0        # 最终综合得分
+    # stage scores
+    vector_score: float = 0.0       # vector retrieval (normalized)
+    bm25_score: float = 0.0         # BM25 retrieval (normalized)
+    fusion_score: float = 0.0       # fusion score (RRF or weighted)
+    rerank_score: float = 0.0       # rerank score
+    final_score: float = 0.0        # final composite score
 
-    # 用于输出来源标注
-    source_label: str = ""          # 格式化的来源标签，如 "[来源: 1]"
+    source_label: str = ""          # formatted source label, e.g. "[来源: 1]"
 
     def to_context_string(self, index: int = 1) -> str:
-        """生成注入 Prompt 的参考文本"""
+        """Format chunk as context text for prompt injection."""
         title = self.metadata.get("title", "未知文档")
         section = self.metadata.get("section", "")
         source_info = f"{title}"
@@ -66,18 +49,17 @@ class RetrievalResult:
 
 @dataclass
 class SearchResult:
-    """完整检索结果"""
+    """Complete search result with quality metadata."""
     query: str
     results: List[RetrievalResult]
 
-    # 检索质量元数据
-    top_similarity: float = 0.0     # 最高相似度
-    avg_similarity: float = 0.0     # 平均相似度
-    result_count: int = 0           # 有效结果数
+    top_similarity: float = 0.0     # highest similarity
+    avg_similarity: float = 0.0     # average similarity
+    result_count: int = 0           # effective result count
 
     @property
     def is_reliable(self) -> bool:
-        """判断检索结果是否可靠（用于知识边界判断）"""
+        """Whether retrieval results are reliable (for knowledge boundary gating)."""
         config = get_config().retrieval
         return (
             self.top_similarity >= config.vector_similarity_threshold
@@ -85,21 +67,10 @@ class SearchResult:
         )
 
 
-# ============================================================================
-# 1. 语义向量检索器
-# ============================================================================
+# /// 1. Semantic vector retriever
 class VectorRetriever:
-    """
-    基于 Embedding 的语义向量检索
-
-    优势：
-      - 理解语义：能匹配"退钱"和"退款"这样的同义表达
-      - 跨语言：中文查询可匹配英文文档（如果 embedding 模型支持）
-
-    局限：
-      - 对专有名词（产品型号、订单号）不敏感
-      - 可能将语义相似但无关的文档排在前面
-    """
+    """Embedding-based semantic vector search. Matches synonyms (e.g., '退钱' vs '退款').
+    Limitation: insensitive to proper nouns (product codes, order numbers)."""
 
     def __init__(self):
         self.embedder = EmbeddingGenerator()
@@ -112,22 +83,13 @@ class VectorRetriever:
         top_k: Optional[int] = None,
         where_filter: Optional[Dict] = None,
     ) -> List[Tuple[Dict, float]]:
-        """
-        执行语义向量检索
-
-        参数:
-          query: 查询文本
-          top_k: 返回数量
-          where_filter: 元数据过滤（如限制特定文档类型）
-
-        返回: [(result_dict, similarity_score), ...]
-        """
+        """Execute semantic vector search. Returns [(result_dict, similarity_score), ...]."""
         top_k = top_k or self.config.top_k_vector
 
-        # 1. 查询向量化
+        # 1. embed query
         query_embedding = self.embedder.embed(query)
 
-        # 2. 向量检索
+        # 2. vector search
         results = self.vector_store.search_by_vector(
             query_embedding=query_embedding,
             top_k=top_k,
@@ -137,26 +99,9 @@ class VectorRetriever:
         return [(r, r["similarity"]) for r in results]
 
 
-# ============================================================================
-# 2. BM25 关键词检索器
-# ============================================================================
+# /// 2. BM25 keyword retriever
 class BM25Retriever:
-    """
-    基于 BM25 算法的关键词检索
-
-    BM25 (Best Match 25) — 信息检索领域的经典算法：
-      - TF-IDF 的改进版，考虑了文档长度归一化
-      - 对精确关键词匹配效果极佳
-
-    适用场景：
-      - 产品型号查询："SKU-2024-PRO"
-      - 错误码查询："Error 503"
-      - 专有名词："VIP会员升级规则"
-
-    注意：
-      - BM25 基于词频统计，需要分词支持
-      - 这里实现了简化的中文+英文混合分词
-    """
+    """BM25 keyword search for exact matches (product codes, order numbers). Must be fused with vector search."""
 
     def __init__(self):
         self.config = get_config().retrieval
@@ -166,11 +111,7 @@ class BM25Retriever:
         self._initialized = False
 
     def build_index(self, chunks: List[Dict]):
-        """
-        从数据库加载所有 chunk 并构建 BM25 索引
-
-        注意：BM25 索引需要全量数据，应在知识库更新后重建。
-        """
+        """Build BM25 index from all chunks. Must be rebuilt after knowledge base updates."""
         from rank_bm25 import BM25Okapi
 
         self._corpus = []
@@ -193,29 +134,22 @@ class BM25Retriever:
             logger.info(f"[BM25Retriever] 索引构建完成: {len(self._corpus)} 个文档")
 
     def _tokenize(self, text: str) -> List[str]:
-        """
-        中文+英文混合分词
+        """Chinese+English hybrid tokenizer. Chinese: character bigrams. English/digits: word-level."""
 
-        简化实现（生产环境建议接入 jieba 或 LAC）：
-          - 中文：按字符 bigram 切分（"退换货" → ["退换", "换货"]）
-          - 英文：按空格和标点切分
-          - 数字/特殊符号：保留连续序列
-        """
         tokens = []
 
-        # 分离中文和非中文部分
-        # 中文部分做 bigram
+        # Chinese: character bigrams
         chinese_chars = re.findall(r"[一-鿿]+", text)
         for segment in chinese_chars:
             for i in range(len(segment) - 1):
                 tokens.append(segment[i:i + 2])
-            tokens.append(segment[-1])  # 单字也保留
+            tokens.append(segment[-1])
 
-        # 英文/数字部分
+        # English/digits: word-level
         non_chinese = re.findall(r"[a-zA-Z0-9]+", text)
         tokens.extend([t.lower() for t in non_chinese])
 
-        # 独立的数字/特殊标识
+        # standalone numbers
         special = re.findall(r"\d+\.?\d*", text)
         tokens.extend(special)
 
@@ -226,11 +160,7 @@ class BM25Retriever:
         query: str,
         top_k: Optional[int] = None,
     ) -> List[Tuple[Dict, float]]:
-        """
-        执行 BM25 关键词检索
-
-        返回: [(result_dict, bm25_score), ...]
-        """
+        """Execute BM25 keyword search. Returns [(result_dict, bm25_score), ...]."""
         if not self._initialized:
             logger.warning("[BM25Retriever] 索引未初始化，返回空结果")
             return []
@@ -241,12 +171,12 @@ class BM25Retriever:
         if not query_tokens:
             return []
 
-        # BM25 检索
+        # BM25 search
         scores = self._bm25.get_scores(query_tokens)
         top_indices = np.argsort(scores)[::-1][:top_k]
 
         results = []
-        max_score = scores.max() if scores.max() > 0 else 1.0  # 避免除零
+        max_score = scores.max() if scores.max() > 0 else 1.0  # avoid division by zero
 
         for idx in top_indices:
             if scores[idx] > 0:
@@ -256,18 +186,15 @@ class BM25Retriever:
                     "id": meta["id"],
                     "content": meta["content"],
                     "metadata": meta["metadata"],
-                    "similarity": normalized_score,  # 与其他检索器统一字段名
+                    "similarity": normalized_score,  # unified field name
                 }, normalized_score))
 
         return results
 
     @staticmethod
     def load_chunks_from_store() -> List[Dict]:
-        """
-        从 ChromaDB 加载所有 chunk 用于构建 BM25 索引
-
-        注意：大规模知识库（>10万条）建议使用数据库全文索引替代内存 BM25。
-        """
+        """Load all chunks from ChromaDB for BM25 index building.
+        For large knowledge bases (>100k chunks), prefer a database full-text index."""
         store = VectorStoreManager()
         # ChromaDB get 方法获取全部数据
         try:
@@ -286,30 +213,11 @@ class BM25Retriever:
             return []
 
 
-# ============================================================================
-# 3. 混合检索融合器
-# ============================================================================
+# /// 3. Hybrid fusion (RRF + weighted)
 class HybridRetriever:
-    """
-    混合检索融合器
-
-    算法：Reciprocal Rank Fusion (RRF)
-      RRF 是当前工业界最常用的混合检索融合算法，优势在于：
-      1. 无需归一化不同检索器的得分分布
-      2. 对排名敏感而对绝对分值不敏感
-      3. 简单高效，可解释性强
-
-    RRF 公式：
-      RRF(d) = Σ 1 / (k + rank_i(d))
-
-      其中：
-        - d: 文档
-        - rank_i(d): 文档 d 在检索器 i 中的排名
-        - k: 平滑参数（通常为 60），防止排名靠后的文档被过度抑制
-
-    同时也支持加权线性融合：
-      fusion_score = α × vector_score + β × bm25_score
-    """
+    """Hybrid retrieval fuser using Reciprocal Rank Fusion (RRF):
+    RRF(d) = sum(1 / (k + rank_i(d))), default k=60.
+    Also supports weighted linear fusion: alpha * vec_score + beta * bm25_score."""
 
     def __init__(self):
         self.config = get_config().retrieval
@@ -322,18 +230,11 @@ class HybridRetriever:
         top_k: Optional[int] = None,
         strategy: str = "rrf",  # "rrf" | "weighted" | "vector_only" | "bm25_only"
     ) -> SearchResult:
-        """
-        混合检索主入口
-
-        流程：
-          1. 并行调用向量检索和 BM25 检索
-          2. RRF 融合排序
-          3. 返回 SearchResult
-        """
+        """Hybrid search main entry. Parallel vector + BM25 search, RRF/weighted fusion, then return SearchResult."""
         top_k = top_k or self.config.top_k_fusion
         logger.info(f"[HybridRetriever] 混合检索: '{query[:50]}...' (strategy={strategy})")
 
-        # Step 1: 并行检索
+        # Step 1: parallel retrieval
         vector_results = self.vector_retriever.search(query)
         bm25_results = self.bm25_retriever.search(query)
 
@@ -342,7 +243,7 @@ class HybridRetriever:
             f"BM25检索: {len(bm25_results)} 条"
         )
 
-        # Step 2: 融合
+        # Step 2: fusion
         if strategy == "vector_only":
             fused = self._fuse_weighted(vector_results, [], top_k)
         elif strategy == "bm25_only":
@@ -352,7 +253,7 @@ class HybridRetriever:
         else:  # weighted
             fused = self._fuse_weighted(vector_results, bm25_results, top_k)
 
-        # Step 3: 构建结果
+        # Step 3: build results
         results = []
         for result_dict, score_map in fused:
             results.append(RetrievalResult(
@@ -365,7 +266,7 @@ class HybridRetriever:
                 final_score=score_map.get("fusion", 0.0),
             ))
 
-        # 计算质量元数据
+        # compute quality metadata
         top_sim = results[0].final_score if results else 0.0
         avg_sim = sum(r.final_score for r in results) / len(results) if results else 0.0
 
@@ -384,17 +285,12 @@ class HybridRetriever:
         top_k: int,
         k: int = 60,
     ) -> List[Tuple[Dict, Dict[str, float]]]:
-        """
-        Reciprocal Rank Fusion (RRF) 融合
+        """Reciprocal Rank Fusion. k is the smoothing parameter (default 60)."""
 
-        参数:
-          k: RRF 平滑参数，默认 60（经典值）
-        """
-        # 建立文档 ID 到数据的映射
         id_to_data: Dict[str, Dict] = {}
         id_to_ranks: Dict[str, Dict[str, int]] = {}
 
-        # 记录各检索器排名
+        # record ranks from each retriever
         for rank, (result, _) in enumerate(vector_results, start=1):
             chunk_id = result["id"]
             id_to_data[chunk_id] = result
@@ -406,7 +302,7 @@ class HybridRetriever:
                 id_to_data[chunk_id] = result
             id_to_ranks.setdefault(chunk_id, {})["bm25"] = rank
 
-        # 计算 RRF 得分
+        # compute RRF scores
         rrf_scores = {}
         for chunk_id, ranks in id_to_ranks.items():
             score = 0.0
@@ -416,17 +312,17 @@ class HybridRetriever:
                 score += 1.0 / (k + ranks["bm25"])
             rrf_scores[chunk_id] = score
 
-        # 按 RRF 得分降序排序
+        # sort by RRF score descending
         sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
         top_ids = sorted_ids[:top_k]
 
-        # 构建带得分信息的返回
+        # build result with score info
         result = []
         for chunk_id in top_ids:
             data = id_to_data[chunk_id]
             ranks = id_to_ranks.get(chunk_id, {})
 
-            # 反算归一化得分（用于展示）
+            # reverse-compute normalized scores for display
             vector_score = 1.0 / (1 + ranks.get("vector", 999)) if "vector" in ranks else 0.0
             bm25_score = 1.0 / (1 + ranks.get("bm25", 999)) if "bm25" in ranks else 0.0
 
@@ -448,19 +344,13 @@ class HybridRetriever:
         bm25_results: List[Tuple[Dict, float]],
         top_k: int,
     ) -> List[Tuple[Dict, Dict[str, float]]]:
-        """
-        加权线性融合
+        """Weighted linear fusion: score = alpha * vec_score + beta * bm25_score.
+        Weights are configurable for tuning precision vs recall."""
 
-        公式: score = α × vector_score + β × bm25_score
-
-        优势：
-          - 可调节两种检索方式的重要性
-          - 得分分布直观
-        """
         alpha = self.config.vector_weight
         beta = self.config.bm25_weight
 
-        # 归一化各检索器得分
+        # normalize scores per retriever
         def normalize(scores: List[float]) -> List[float]:
             if not scores:
                 return scores
@@ -510,26 +400,11 @@ class HybridRetriever:
         return result
 
 
-# ============================================================================
-# 4. 重排序器 (Re-Ranker)
-# ============================================================================
+# /// 4. Re-ranker
 class Reranker:
-    """
-    重排序器 — 对初步召回结果进行精细化打分
-
-    为什么需要重排序？
-      - 向量检索 + BM25 是粗排（追求召回率高）
-      - 粗排结果中可能混入"看起来相关但实际不匹配"的文档
-      - 重排序用更强的模型（Cross-Encoder 或 LLM）做精排
-      - 精排后过滤低分结果，确保送给 LLM 的都是高质量上下文
-
-    实现方案（按效果排序）：
-      1. Cross-Encoder 模型（如 bge-reranker-large）— 效果最好
-      2. LLM 打分（DeepSeek 逐条评分）— 灵活性最高
-      3. 基于 Embedding 的相似度排序 — 最简单（无需额外模型）
-
-    当前实现：LLM-based 重排序（可切换为 Cross-Encoder）
-    """
+    """Re-ranker for fine-grained scoring of candidate results. Vector+BM25 is coarse
+    recall; re-ranking with LLM (or Cross-Encoder) filters low-relevance noise so
+    only high-quality context reaches the generator."""
 
     def __init__(self):
         self.config = get_config()
@@ -541,15 +416,7 @@ class Reranker:
         candidates: List[RetrievalResult],
         top_k: Optional[int] = None,
     ) -> List[RetrievalResult]:
-        """
-        对候选结果重排序
-
-        流程：
-          1. 逐条评估 query-candidate 的相关性
-          2. 按相关性得分重排序
-          3. 过滤低分结果
-          4. 分配来源标签
-        """
+        """Rerank candidates: score each, sort by relevance, filter low-scoring, assign source labels."""
         top_k = top_k or self.config.retrieval.top_k_final
 
         if not candidates:
@@ -557,23 +424,23 @@ class Reranker:
 
         logger.info(f"[Reranker] 重排序 {len(candidates)} 条候选结果")
 
-        # 逐一评分
+        # score each candidate
         for candidate in candidates:
             candidate.rerank_score = self._score_candidate(query, candidate)
 
-        # 按重排序得分降序
+        # sort by rerank score descending
         reranked = sorted(candidates, key=lambda x: x.rerank_score, reverse=True)
 
-        # 过滤低分结果
+        # filter low-scoring results
         filtered = [
             r for r in reranked
             if r.rerank_score >= self.config.retrieval.rerank_relevance_threshold
         ]
 
-        # 截取 top_k
+        # take top_k
         final = filtered[:top_k]
 
-        # 分配来源标签
+        # assign source labels
         for i, result in enumerate(final):
             result.source_label = f"[来源: {i + 1}]"
             result.final_score = result.rerank_score
@@ -590,37 +457,20 @@ class Reranker:
         query: str,
         candidate: RetrievalResult,
     ) -> float:
-        """
-        评估单条候选结果的相关性
-
-        返回: 0.0 ~ 1.0 的相关性得分
-        """
-        # 方案 A: 基于向量相似度的快速评分（默认）
+        """Score a single candidate. Uses fusion_score if rerank is disabled, else LLM scoring."""
+        # Path A: fast vector-similarity-based scoring (default when rerank disabled)
         if not self.config.retrieval.enable_rerank:
             return candidate.fusion_score
 
-        # 方案 B: LLM 评分（精确但较慢）
+        # Path B: LLM-based scoring (slower but more accurate)
         return self._llm_score(query, candidate)
 
     def _llm_score(self, query: str, candidate: RetrievalResult) -> float:
-        """
-        使用 LLM 评估相关性
-
-        Prompt 设计要点：
-          - 明确评分标准（0-10 分）
-          - 要求结构化输出（JSON）
-          - 给出评分依据
-        """
-        from openai import OpenAI
-        from config import get_api_key
-
-        api_key = get_api_key()
-        if not api_key:
-            raise ValueError("DEEPSEEK_API_KEY 未设置")
-        client = OpenAI(
-            api_key=api_key,
-            base_url=self.config.llm.base_url,
-        )
+        """Use LLM to score query-candidate relevance on 0-10 scale, normalized to 0-1."""
+        from config import get_llm_client
+        client = get_llm_client()
+        if client is None:
+            return candidate.fusion_score
 
         prompt = f"""请评估以下文档片段对用户查询的相关性。
 
@@ -651,58 +501,24 @@ class Reranker:
             )
 
             result_text = response.choices[0].message.content or "{}"
-            # 提取 JSON
+            # extract JSON
             import json
             json_match = re.search(r"\{[^}]+\}", result_text, re.DOTALL)
             if json_match:
                 scores = json.loads(json_match.group())
                 overall = scores.get("overall", 5)
-                return overall / 10.0  # 归一化到 0-1
+                return overall / 10.0  # normalize to 0-1
             return 0.5
 
         except Exception as e:
             logger.error(f"[Reranker] LLM 评分失败: {e}")
-            return candidate.fusion_score  # 回退到融合得分
-
-    def _cross_encoder_score(
-        self,
-        query: str,
-        candidates: List[RetrievalResult],
-    ) -> List[float]:
-        """
-        Cross-Encoder 批量评分（更快的方案）
-
-        需要: pip install sentence-transformers
-        模型: BAAI/bge-reranker-v2-m3（多语言支持）
-        """
-        try:
-            from sentence_transformers import CrossEncoder
-        except ImportError:
-            logger.warning("[Reranker] sentence-transformers 未安装，回退到 LLM 评分")
-            return [self._llm_score(query, c) for c in candidates]
-
-        if self._cross_encoder is None:
-            model_name = "BAAI/bge-reranker-v2-m3"
-            logger.info(f"[Reranker] 加载 Cross-Encoder: {model_name}")
-            self._cross_encoder = CrossEncoder(model_name)
-
-        pairs = [[query, c.content] for c in candidates]
-        scores = self._cross_encoder.predict(pairs)
-        # sigmoid 归一化
-        scores = 1.0 / (1.0 + np.exp(-np.array(scores)))
-        return scores.tolist()
+            return candidate.fusion_score  # fall back to fusion score
 
 
-# ============================================================================
-# 5. 统一检索服务（Facade 模式）
-# ============================================================================
+# /// 5. Unified retrieval service (Facade)
 class RetrievalService:
-    """
-    统一检索服务 — 对外暴露的单一入口
-
-    整合了混合检索 + 重排序的完整流程。
-    外部调用者只需使用此类，无需关心底层实现细节。
-    """
+    """Unified retrieval service -- single entry point combining hybrid retrieval + reranking.
+    External callers use only this class; internal components are hidden."""
 
     def __init__(self):
         self.hybrid_retriever = HybridRetriever()
@@ -713,7 +529,7 @@ class RetrievalService:
         self._init_bm25_index()
 
     def _init_bm25_index(self):
-        """初始化 BM25 索引"""
+        """Initialize BM25 index from ChromaDB."""
         try:
             chunks = BM25Retriever.load_chunks_from_store()
             if chunks:
@@ -730,25 +546,14 @@ class RetrievalService:
         strategy: str = "rrf",
         enable_rerank: Optional[bool] = None,
     ) -> SearchResult:
-        """
-        统一检索接口
-
-        参数:
-          query: 用户查询
-          top_k: 最终返回数（默认 5）
-          strategy: 融合策略 "rrf" | "weighted" | "vector_only" | "bm25_only"
-          enable_rerank: 是否启用重排序（默认使用配置）
-
-        返回:
-          SearchResult 包含排好序的 RetrievalResult 列表
-        """
+        """Unified retrieval. strategy: "rrf" | "weighted" | "vector_only" | "bm25_only"."""
         top_k = top_k or self.config.top_k_final
         enable_rerank = enable_rerank if enable_rerank is not None else self.config.enable_rerank
 
-        # Step 1: 混合检索（粗排）
+        # Step 1: hybrid retrieval (coarse ranking)
         search_result = self.hybrid_retriever.search(query, top_k=self.config.top_k_fusion, strategy=strategy)
 
-        # Step 2: 重排序（精排）
+        # Step 2: rerank (fine ranking)
         if enable_rerank and search_result.results:
             reranked = self.reranker.rerank(query, search_result.results, top_k)
             search_result.results = reranked
@@ -758,23 +563,15 @@ class RetrievalService:
         return search_result
 
     def rebuild_bm25_index(self):
-        """重建 BM25 索引（知识库更新后调用）"""
+        """Rebuild BM25 index after knowledge base updates."""
         chunks = BM25Retriever.load_chunks_from_store()
         self.hybrid_retriever.bm25_retriever.build_index(chunks)
 
 
-# ============================================================================
-# 独立测试入口
-# ============================================================================
+# /// Self-check
 if __name__ == "__main__":
-    """
-    快速验证检索层功能：
-
-        python retrieval_layer.py
-    """
-    logger.info("=" * 60)
-    logger.info("DeepService Retrieval Layer — 独立测试")
-    logger.info("=" * 60)
+    """Quick self-check. Run: python retrieval_layer.py"""
+    logger.info("DeepService Retrieval Layer — self-check")
 
     service = RetrievalService()
 
@@ -797,5 +594,4 @@ if __name__ == "__main__":
         else:
             logger.info("  无相关结果")
 
-    logger.info("=" * 60)
-    logger.info("检索层测试完成 ✓")
+    logger.info("Retrieval layer self-check complete.")
