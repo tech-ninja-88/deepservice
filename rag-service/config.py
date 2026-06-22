@@ -5,7 +5,7 @@ environment variables; thresholds overridable via admin API.
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Literal
+from typing import List, Optional, Literal
 from pathlib import Path
 
 from dotenv import load_dotenv
