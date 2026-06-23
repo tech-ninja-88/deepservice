@@ -59,7 +59,7 @@ def get_llm_client() -> Optional[OpenAI]:
         from loguru import logger
         logger.warning("DEEPSEEK_API_KEY not set — LLM features disabled")
         return None
-    return OpenAI(api_key=api_key, base_url=cfg.base_url)
+    return OpenAI(api_key=api_key, base_url=cfg.base_url, timeout=30.0)
 
 
 # ---- Data model configurations ----

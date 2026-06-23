@@ -282,7 +282,12 @@ class DeepSeekClient:
 
         except Exception as e:
             logger.error(f"[DeepSeekClient] API call failed: {e}")
-            raise
+            return {
+                "content": f"抱歉，AI 服务暂时不可用（{str(e)[:80]}），请稍后重试。",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "finish_reason": "error",
+                "model": "error",
+            }
 
     def chat_stream(
         self,
@@ -332,7 +337,8 @@ class DeepSeekClient:
 
         except Exception as e:
             logger.error(f"[DeepSeekClient] Stream call failed: {e}")
-            raise
+            yield TokenStream(content=f"抱歉，AI 服务暂时不可用（{str(e)[:80]}），请稍后重试。")
+            yield TokenStream(content="", finish_reason="error")
 
         return usage
 
