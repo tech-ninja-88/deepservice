@@ -34,9 +34,11 @@ spec:
         - port: 3000
           expose: true
       env:
-        # Leave NEXT_PUBLIC_API_URL empty → relative URLs + rewrite proxy
+        # Empty = browser uses relative URLs (/api/*) → Next.js rewrite proxy → backend:8000
+        # This is the CORRECT config for Sealos. Do NOT set to http://backend:8000 —
+        # the browser cannot resolve Kubernetes internal DNS names.
         - name: NEXT_PUBLIC_API_URL
-          value: "http://backend:8000"
+          value: ""
       resources:
         cpu: 250m
         memory: 256Mi
